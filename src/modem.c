@@ -790,17 +790,12 @@ static void process_line(const char *line)
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
-            /* flush stale URCs — IWDG refresh every 500 ms inside */
-            {
-                uint8_t _c;
-                uint32_t _t = HAL_GetTick();
-                while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {
-                    if (HAL_GetTick() - _t >= 500) {
-                        HAL_IWDG_Refresh(&hiwdg);
-                        _t = HAL_GetTick();
-                    }
-                }
-            }
+            /* Do NOT flush here — the broker delivers any retained message
+             * (e.g. pump/01/ota) immediately after +QMTSUB: 0,2,0.  A flush
+             * loop at 115200 baud has no 1ms gap and swallows the entire
+             * QMTRECV line, silently discarding the OTA trigger.
+             * Just reset the partial-line buffer; stale "OK" or duplicate
+             * +QMTSUB lines in CONNECTED state are harmless.               */
             rxpos = 0;
             HAL_IWDG_Refresh(&hiwdg);
 
