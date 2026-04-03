@@ -47,6 +47,12 @@ void OTA_Process(void);
  * url must remain valid until OTA completes (it is copied internally). */
 void OTA_Start(const char *url);
 
+/* Called by modem.c after the AT+QHTTPURL/CONNECT/URL/OK exchange has been
+ * completed synchronously (blocking poll).  Skips the URL-setup states and
+ * enters directly at AT+QHTTPGET so the state machine only handles the GET,
+ * file-read, and flash phases.                                              */
+void OTA_StartFromGet(const char *url);
+
 /* Called by modem.c process_line() — passes AT response lines to OTA state
  * machine.  modem.c should call this (and return early) for ALL lines while
  * OTA_IsActive() is true so OTA URCs are not misinterpreted as MQTT ones.  */

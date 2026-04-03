@@ -34,7 +34,8 @@ extern IWDG_HandleTypeDef hiwdg;
 typedef enum {
     OTA_ST_IDLE,
     OTA_ST_SSL_ENABLE,      /* sent AT+QHTTPCFG="ssl",1, waiting OK          */
-    OTA_ST_SSL_SECLEVEL,    /* sent AT+QSSLCFG="seclevel",1,0, waiting OK   */
+    OTA_ST_SSL_SECLEVEL,    /* sent AT+QSSLCFG="seclevel",1,1, waiting OK   */
+    OTA_ST_SSL_CACERT,      /* sent AT+QSSLCFG="cacert",1,"cacert.pem", waiting OK */
     OTA_ST_SSL_VERSION,     /* sent AT+QSSLCFG="sslversion",1,4, waiting OK  */
     OTA_ST_SSL_CIPHER,      /* sent AT+QSSLCFG="ciphersuite",1,0xFFFF, waiting OK */
     OTA_ST_SSL_CTXID,       /* sent AT+QHTTPCFG="sslctxid",1, waiting OK     */
@@ -104,6 +105,7 @@ static void ota_enter(OTA_State s, uint32_t timeout_ms)
     char dbg[64];
     snprintf(dbg, sizeof(dbg), "[OTA] Enter state %d, timeout %lu ms\r\n", s, (unsigned long)timeout_ms);
     Debug_Print(dbg);
+
 }
 
 static void ota_error(const char *reason)
@@ -207,6 +209,7 @@ void OTA_Start(const char *url)
     ota_bin_pos      = 0;
 
     ota_publish("{\"ota_status\":\"starting\"}");
+    ota_publish("{\"ota_test\":\"debug enabled\"}");  // Test to confirm code update
 
     /* Enable SSL if URL is HTTPS */
     if (strncmp(ota_url, "https://", 8) == 0) {
@@ -258,27 +261,43 @@ void OTA_HandleLine(const char *line)
     snprintf(dbg, sizeof(dbg), "[OTA] Received: %s\r\n", line);
     Debug_Print(dbg);
 
+    // Publish received line for MQTT logging
+    char recv_msg[256];
+    snprintf(recv_msg, sizeof(recv_msg), "{\"ota_debug\":\"Received: %s\"}", line);
+    ota_publish(recv_msg);
+
     /* Lines that matter in each state */
     switch (ota_state) {
 
     case OTA_ST_SSL_ENABLE:
         if (strcmp(line, "OK") == 0) {
-            ota_send("AT+QSSLCFG=\"seclevel\",1,0");
+            ota_send("AT+QSSLCFG=\"seclevel\",1,1");  // seclevel=1 to require CA verification
             ota_enter(OTA_ST_SSL_SECLEVEL, 5000);
+            ota_publish("{\"ota_debug\":\"SSL enable OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL enable failed");
         break;
 
     case OTA_ST_SSL_SECLEVEL:
         if (strcmp(line, "OK") == 0) {
+            ota_send("AT+QSSLCFG=\"cacert\",1,\"cacert.pem\"");  // Reference uploaded CA cert
+            ota_enter(OTA_ST_SSL_CACERT, 5000);
+            ota_publish("{\"ota_debug\":\"SSL seclevel OK\"}");
+        } else if (strstr(line, "ERROR")) ota_error("SSL seclevel failed");
+        break;
+
+    case OTA_ST_SSL_CACERT:
+        if (strcmp(line, "OK") == 0) {
             ota_send("AT+QSSLCFG=\"sslversion\",1,4");
             ota_enter(OTA_ST_SSL_VERSION, 5000);
-        } else if (strstr(line, "ERROR")) ota_error("SSL seclevel failed");
+            ota_publish("{\"ota_debug\":\"SSL cacert OK\"}");
+        } else if (strstr(line, "ERROR")) ota_error("SSL cacert failed");
         break;
 
     case OTA_ST_SSL_VERSION:
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF");
             ota_enter(OTA_ST_SSL_CIPHER, 5000);
+            ota_publish("{\"ota_debug\":\"SSL version OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL version failed");
         break;
 
@@ -286,6 +305,7 @@ void OTA_HandleLine(const char *line)
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QHTTPCFG=\"sslctxid\",1");
             ota_enter(OTA_ST_SSL_CTXID, 5000);
+            ota_publish("{\"ota_debug\":\"SSL cipher OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL cipher failed");
         break;
 
@@ -296,6 +316,7 @@ void OTA_HandleLine(const char *line)
             snprintf(cmd, sizeof(cmd), "AT+QHTTPURL=%d,30", (int)strlen(ota_url));
             ota_send(cmd);
             ota_enter(OTA_ST_HTTP_URL_CMD, 10000);
+            ota_publish("{\"ota_debug\":\"SSL ctxid OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL ctxid failed");
         break;
 
@@ -304,6 +325,7 @@ void OTA_HandleLine(const char *line)
             /* modem is ready for URL text — send it now */
             if (ota_send_fn) ota_send_fn(ota_url);  /* no \r\n — modem ends on OK */
             ota_enter(OTA_ST_HTTP_URL_BODY, 10000);
+            ota_publish("{\"ota_debug\":\"HTTP URL CONNECT\"}");
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPURL cmd failed");
         break;
@@ -360,6 +382,7 @@ void OTA_HandleLine(const char *line)
             /* File open; send first read request */
             ota_send("AT+QFREAD=0,256");
             ota_enter(OTA_ST_CHUNK_READ, OTA_READ_TIMEOUT_MS);
+            ota_publish("{\"ota_debug\":\"File opened\"}");
         }
         if (strstr(line, "ERROR")) ota_error("QFOPEN failed");
         break;
@@ -371,6 +394,9 @@ void OTA_HandleLine(const char *line)
             if (n == 0) { ota_error("QFREAD zero bytes"); break; }
             OTA_SetBinaryExpect(n);
             /* OTA_ST_CHUNK_BINARY entered by OTA_SetBinaryExpect() */
+            char chunk_msg[64];
+            snprintf(chunk_msg, sizeof(chunk_msg), "{\"ota_debug\":\"Chunk read: %lu bytes\"}", (unsigned long)n);
+            ota_publish(chunk_msg);
         }
         if (strstr(line, "ERROR")) ota_error("QFREAD failed");
         break;
@@ -412,6 +438,9 @@ void OTA_Process(void)
             char dbg[64];
             snprintf(dbg, sizeof(dbg), "[OTA] Timeout in state %d: %s\r\n", ota_state, why);
             Debug_Print(dbg);
+            char timeout_msg[128];
+            snprintf(timeout_msg, sizeof(timeout_msg), "{\"ota_debug\":\"Timeout in state %d: %s\"}", ota_state, why);
+            ota_publish(timeout_msg);
             ota_error(why);
             return;
         }
@@ -468,6 +497,7 @@ void OTA_Process(void)
             /* All chunks received — close file */
             ota_send("AT+QFCLOSE=0");
             ota_enter(OTA_ST_FILE_CLOSE, 5000);
+            ota_publish("{\"ota_debug\":\"All chunks received, closing file\"}");
         }
         break;
     }

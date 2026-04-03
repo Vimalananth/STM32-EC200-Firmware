@@ -922,7 +922,18 @@ static void modem_ota_start(const char *url)
 
     /* Publish "starting" — tells bridge.js to clear the retained OTA message
      * on pump/01/ota so the board doesn't re-trigger OTA on every reconnect. */
-    if (mqtt_state == MQTT_STATE_CONNECTED) {
+    /* Publish "starting" even if a status heartbeat is mid-flight.
+     * The retained pump/01/ota message often arrives while mqtt_state is
+     * PUBLISHING or PUB_WAIT_OK (connection heartbeat queued immediately on
+     * CONNECTED).  Wait 700 ms for the in-progress publish to complete, then
+     * flush stale modem bytes before sending our own AT+QMTPUBEX.            */
+    if (mqtt_state == MQTT_STATE_CONNECTED  ||
+        mqtt_state == MQTT_STATE_PUBLISHING ||
+        mqtt_state == MQTT_STATE_PUB_WAIT_OK) {
+        HAL_Delay(700);                        /* let previous publish finish */
+        HAL_IWDG_Refresh(&hiwdg);
+        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
+
         const char *ota_payload = "{\"ota_status\":\"starting\"}";
         char pub_cmd[80];
         snprintf(pub_cmd, sizeof(pub_cmd),
