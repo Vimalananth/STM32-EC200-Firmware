@@ -951,7 +951,11 @@ static void modem_ota_start(const char *url)
         if (got_prompt) {
             HAL_UART_Transmit(modem_uart, (uint8_t*)ota_payload,
                               strlen(ota_payload), 1000);
-            HAL_Delay(500);
+            uint8_t ctrlz = 0x1A;  /* Ctrl-Z commits the MQTT publish */
+            HAL_UART_Transmit(modem_uart, &ctrlz, 1, 1000);
+            HAL_Delay(500);        /* wait for modem to process publish */
+            /* Flush +QMTPUBEX response so it doesn't interfere with SSL cmds */
+            { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
         }
         HAL_IWDG_Refresh(&hiwdg);
     }
