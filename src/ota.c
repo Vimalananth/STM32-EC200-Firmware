@@ -27,12 +27,17 @@ extern IWDG_HandleTypeDef hiwdg;
 #define OTA_CHUNK_SIZE   256U          /* bytes per AT+QFREAD request       */
 #define OTA_STATUS_TOPIC "pump/01/ota/status"
 #define OTA_PROGRESS_EVERY (4096U)     /* publish progress every 4 KB       */
-#define OTA_CMD_TIMEOUT_MS 90000UL    /* 90 s for HTTP GET (GitHub redirect)*/
+#define OTA_CMD_TIMEOUT_MS 120000UL  /* 120 s for HTTP GET; modem given 110 s (see OTA_StartFromGet) */
 #define OTA_READ_TIMEOUT_MS 10000UL   /* 10 s per chunk read               */
 
 /* ── State machine ──────────────────────────────────────────────────────── */
 typedef enum {
     OTA_ST_IDLE,
+    OTA_ST_SSL_ENABLE,      /* sent AT+QHTTPCFG="ssl",1, waiting OK          */
+    OTA_ST_SSL_SECLEVEL,    /* sent AT+QSSLCFG="seclevel",1,0, waiting OK   */
+    OTA_ST_SSL_VERSION,     /* sent AT+QSSLCFG="sslversion",1,4, waiting OK  */
+    OTA_ST_SSL_CIPHER,      /* sent AT+QSSLCFG="ciphersuite",1,0xFFFF, waiting OK */
+    OTA_ST_SSL_CTXID,       /* sent AT+QHTTPCFG="sslctxid",1, waiting OK     */
     OTA_ST_HTTP_URL_CMD,    /* sent AT+QHTTPURL, waiting for CONNECT prompt  */
     OTA_ST_HTTP_URL_BODY,   /* sent URL text, waiting for OK                 */
     OTA_ST_HTTP_GET,        /* sent AT+QHTTPGET, waiting for +QHTTPGET URC   */
@@ -96,6 +101,9 @@ static void ota_enter(OTA_State s, uint32_t timeout_ms)
     ota_state      = s;
     ota_state_ms   = HAL_GetTick();
     ota_timeout_ms = timeout_ms;
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "[OTA] Enter state %d, timeout %lu ms\r\n", s, (unsigned long)timeout_ms);
+    Debug_Print(dbg);
 }
 
 static void ota_error(const char *reason)
@@ -103,7 +111,14 @@ static void ota_error(const char *reason)
     char msg[128];
     snprintf(msg, sizeof(msg), "{\"ota_status\":\"error\",\"reason\":\"%s\"}", reason);
     ota_publish(msg);
+    /* Cancel any pending HTTP session so the modem is free for MQTT reconnect.
+     * Without this, AT+QMTCLOSE / AT+QIDEACT are ignored while the modem is
+     * still waiting for AT+QHTTPGET to complete, leaving the board stuck offline. */
+    ota_send("AT+QHTTPSTOP");
     ota_enter(OTA_ST_ERROR, 0);
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "[OTA] Error: %s\r\n", reason);
+    Debug_Print(dbg);
 }
 
 /* ── Flash write helpers ─────────────────────────────────────────────────── */
@@ -193,17 +208,96 @@ void OTA_Start(const char *url)
 
     ota_publish("{\"ota_status\":\"starting\"}");
 
-    /* AT+QHTTPURL=<len>,30 */
+    /* Enable SSL if URL is HTTPS */
+    if (strncmp(ota_url, "https://", 8) == 0) {
+        Debug_Print("[OTA] Enabling HTTPS with insecure config\r\n");
+        ota_send("AT+QHTTPCFG=\"ssl\",1");
+        ota_enter(OTA_ST_SSL_ENABLE, 5000);
+    } else {
+        /* No SSL — go straight to URL */
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "AT+QHTTPURL=%d,30", (int)strlen(ota_url));
+        ota_send(cmd);
+        ota_enter(OTA_ST_HTTP_URL_CMD, 10000);
+    }
+}
+
+void OTA_StartFromGet(const char *url)
+{
+    if (OTA_IsActive()) return;
+
+    strncpy(ota_url, url, sizeof(ota_url) - 1);
+    ota_url[sizeof(ota_url) - 1] = '\0';
+    ota_file_size     = 0;
+    ota_offset        = 0;
+    ota_crc32         = 0xFFFFFFFFUL;
+    ota_last_progress = 0;
+    ota_bin_expect    = 0;
+    ota_bin_pos       = 0;
+
+    /* Publish a "http_get" status so the error message saved in modem.c's
+     * ota_error_msg shows we reached this stage.  This survives MQTT reconnect
+     * and will be overwritten by the real error/success when OTA completes.  */
+    ota_publish("{\"ota_status\":\"http_get\"}");
+
+    /* URL already accepted by modem — go straight to HTTP GET.
+     * Give the modem a timeout 10 s shorter than the firmware state-machine
+     * timeout.  This guarantees the modem generates +QHTTPGET URC before
+     * OTA_Process fires ota_error(), so we never race AT+QHTTPSTOP against
+     * a still-running GET (which leaves the modem in an unresponsive state). */
     char cmd[32];
-    snprintf(cmd, sizeof(cmd), "AT+QHTTPURL=%d,30", (int)strlen(ota_url));
+    snprintf(cmd, sizeof(cmd), "AT+QHTTPGET=%lu",
+             (unsigned long)((OTA_CMD_TIMEOUT_MS - 10000UL) / 1000UL));
     ota_send(cmd);
-    ota_enter(OTA_ST_HTTP_URL_CMD, 10000);
+    ota_enter(OTA_ST_HTTP_GET, OTA_CMD_TIMEOUT_MS);
 }
 
 void OTA_HandleLine(const char *line)
 {
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "[OTA] Received: %s\r\n", line);
+    Debug_Print(dbg);
+
     /* Lines that matter in each state */
     switch (ota_state) {
+
+    case OTA_ST_SSL_ENABLE:
+        if (strcmp(line, "OK") == 0) {
+            ota_send("AT+QSSLCFG=\"seclevel\",1,0");
+            ota_enter(OTA_ST_SSL_SECLEVEL, 5000);
+        } else if (strstr(line, "ERROR")) ota_error("SSL enable failed");
+        break;
+
+    case OTA_ST_SSL_SECLEVEL:
+        if (strcmp(line, "OK") == 0) {
+            ota_send("AT+QSSLCFG=\"sslversion\",1,4");
+            ota_enter(OTA_ST_SSL_VERSION, 5000);
+        } else if (strstr(line, "ERROR")) ota_error("SSL seclevel failed");
+        break;
+
+    case OTA_ST_SSL_VERSION:
+        if (strcmp(line, "OK") == 0) {
+            ota_send("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF");
+            ota_enter(OTA_ST_SSL_CIPHER, 5000);
+        } else if (strstr(line, "ERROR")) ota_error("SSL version failed");
+        break;
+
+    case OTA_ST_SSL_CIPHER:
+        if (strcmp(line, "OK") == 0) {
+            ota_send("AT+QHTTPCFG=\"sslctxid\",1");
+            ota_enter(OTA_ST_SSL_CTXID, 5000);
+        } else if (strstr(line, "ERROR")) ota_error("SSL cipher failed");
+        break;
+
+    case OTA_ST_SSL_CTXID:
+        if (strcmp(line, "OK") == 0) {
+            /* Config done — now set URL */
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "AT+QHTTPURL=%d,30", (int)strlen(ota_url));
+            ota_send(cmd);
+            ota_enter(OTA_ST_HTTP_URL_CMD, 10000);
+        } else if (strstr(line, "ERROR")) ota_error("SSL ctxid failed");
+        break;
 
     case OTA_ST_HTTP_URL_CMD:
         if (strstr(line, "CONNECT")) {
@@ -228,11 +322,17 @@ void OTA_HandleLine(const char *line)
 
     case OTA_ST_HTTP_GET:
         if (strstr(line, "+QHTTPGET:")) {
-            /* +QHTTPGET: 0,<http_code>,<content_length> */
+            /* Format A: +QHTTPGET: 0,<http_code>,<content_length>
+             * Format B: +QHTTPGET: 0,0,<http_code>,<content_length>  (some FW versions)
+             * Skip commas until we find http_code == 200 or 206. */
             const char *p = strchr(line, ',');
             if (!p) { ota_error("QHTTPGET bad response"); break; }
-            int http_code = atoi(p + 1);
-            /* GitHub releases redirect → EC200U follows, final code = 200 */
+            int http_code = 0;
+            while (p) {
+                http_code = atoi(p + 1);
+                if (http_code == 200 || http_code == 206) break;
+                p = strchr(p + 1, ',');
+            }
             if (http_code != 200 && http_code != 206) {
                 ota_error("HTTP not 200");
                 break;
@@ -309,6 +409,9 @@ void OTA_Process(void)
                 case OTA_ST_FILE_CLOSE:    why = "fclose TO";   break;
                 default:                   why = "timeout";     break;
             }
+            char dbg[64];
+            snprintf(dbg, sizeof(dbg), "[OTA] Timeout in state %d: %s\r\n", ota_state, why);
+            Debug_Print(dbg);
             ota_error(why);
             return;
         }

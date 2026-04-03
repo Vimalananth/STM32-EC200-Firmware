@@ -57,15 +57,15 @@ extern IWDG_HandleTypeDef hiwdg;
 #define TOPIC_OTA    "pump/" PUMP_ID "/ota"
 
 /* ── Protection thresholds ──────────────────────────────────────────────── */
-#define V_OVERVOLTAGE 460.0f  /* V  — any phase above this trips relay  */
-#define V_UNDERVOLTAGE 360.0f /* V  — any phase below this trips relay  */
-#define V_PHASE_LOSS 50.0f    /* V  — phase considered lost             */
+#define V_OVERVOLTAGE 480.0f  /* V  — any L-L above this trips relay (415 V nominal +16%) */
+#define V_UNDERVOLTAGE 340.0f /* V  — any L-L below this trips relay (415 V nominal -18%) */
+#define V_PHASE_LOSS 200.0f   /* V  — L-L below this = phase lost (half of 415 V nominal) */
 #define DRY_RUN_AMPS 1.5f     /* A  — below this = dry running          */
 #define DRY_RUN_SECS 8        /* consecutive seconds before trip        */
 #define LOCKOUT_MS 300000UL   /* 5 min lockout after dry-run trip       */
 
 /* ── Heartbeat interval (event-driven: also publish on every state change) ── */
-#define HEARTBEAT_INTERVAL_MS 60000UL
+#define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
 
 /* ── RX buffer ──────────────────────────────────────────────────────────── */
 #define RX_BUF_SIZE 512
@@ -108,6 +108,9 @@ static uint32_t lockout_until = 0;
 static char pub_topic[48];
 static char pub_payload[300];
 static bool pub_pending = false;
+
+/* OTA error saved here so it survives MQTT reconnect (heartbeat would overwrite pub_pending) */
+static char ota_error_msg[80];
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
@@ -166,46 +169,43 @@ static void modem_cmd(const char *cmd)
  * Relay control
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Latching relay helpers — pulse a coil for 50 ms then release */
-static void relay_pulse(GPIO_TypeDef *port, uint16_t pin)
-{
-    HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);
-    HAL_Delay(50);
-    HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
-}
+/* Latching relay via transistor (HIGH = transistor ON = coil energised):
+ *   Pump1: PA1 → SET coil, PB3 → RESET coil
+ *   Pump2: PB4 → SET coil, PB5 → RESET coil
+ * Pulse HIGH 200 ms to latch; relay holds position without power */
 
 void Relay1_Set(bool on)
 {
     relay1 = on;
-    if (on)
-        relay_pulse(Relay_Pin_GPIO_Port,   Relay_Pin_Pin);   /* SET coil  PA5 */
-    else
-        relay_pulse(Relay1_RST_GPIO_Port,  Relay1_RST_Pin);  /* RST coil  PA4 */
+    if (on) {
+        HAL_GPIO_WritePin(Relay_Pin_GPIO_Port,  Relay_Pin_Pin,  GPIO_PIN_SET);   /* PB3 HIGH — SET coil pulse start  */
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(Relay_Pin_GPIO_Port,  Relay_Pin_Pin,  GPIO_PIN_RESET); /* PB3 LOW  — SET coil pulse end    */
+    } else {
+        HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_SET);   /* PA1 HIGH — RESET coil pulse start */
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_RESET); /* PA1 LOW  — RESET coil pulse end   */
+    }
 }
 
 void Relay2_Set(bool on)
 {
     relay2 = on;
-    if (on)
-        relay_pulse(Relay2_Pin_GPIO_Port,  Relay2_Pin_Pin);  /* SET coil  PA1 */
-    else
-        relay_pulse(Relay2_RST_GPIO_Port,  Relay2_RST_Pin);  /* RST coil  PA0 */
+    if (on) {
+        HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_SET);   /* PB4 HIGH — SET coil pulse start  */
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_RESET); /* PB4 LOW  — SET coil pulse end    */
+    } else {
+        HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_SET);   /* PB5 HIGH — RESET coil pulse start */
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET); /* PB5 LOW  — RESET coil pulse end   */
+    }
 }
 
 static void blink_n(int n)
 {
-    /* Use Relay1 latching coils for status blinks.
-     * Save logical state and restore after blinking. */
-    bool saved = relay1;
-    for (int i = 0; i < n; i++) {
-        relay_pulse(Relay_Pin_GPIO_Port,  Relay_Pin_Pin);   /* SET — latch ON  */
-        HAL_Delay(150);
-        relay_pulse(Relay1_RST_GPIO_Port, Relay1_RST_Pin);  /* RST — latch OFF */
-        if (i < n - 1) HAL_Delay(350);
-        HAL_IWDG_Refresh(&hiwdg);
-    }
-    /* Restore previous relay state */
-    Relay1_Set(saved);
+    /* PA1 is now RESET coil — cannot use for diagnostic blink (would unlatch relay) */
+    (void)n;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -278,26 +278,21 @@ static void publish_status(void)
     float i  = Sensor_ReadCurrentACS712();
 
     char sv1[12], sv2[12], sv3[12], sci[12];
-    char spf1[8], spf2[8], spf3[8];
-    fmt_f1(sv1,  sizeof(sv1),  v1);
-    fmt_f1(sv2,  sizeof(sv2),  v2);
-    fmt_f1(sv3,  sizeof(sv3),  v3);
-    fmt_f2(sci,  sizeof(sci),  i);
-    fmt_f2(spf1, sizeof(spf1), Modbus_GetPF1());
-    fmt_f2(spf2, sizeof(spf2), Modbus_GetPF2());
-    fmt_f2(spf3, sizeof(spf3), Modbus_GetPF3());
+    fmt_f1(sv1, sizeof(sv1), v1);
+    fmt_f1(sv2, sizeof(sv2), v2);
+    fmt_f1(sv3, sizeof(sv3), v3);
+    fmt_f2(sci, sizeof(sci), i);
 
-    char payload[384];
+    char payload[256];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"v1\":%s,\"v2\":%s,\"v3\":%s,"
-             "\"current\":%s,\"pf1\":%s,\"pf2\":%s,\"pf3\":%s,"
+             "\"current\":%s,"
              "\"dry_run\":%s,\"online\":true,"
              "\"mb_ok\":%d,\"mb_rx\":%d,\"rssi\":%d}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              sv1, sv2, sv3, sci,
-             spf1, spf2, spf3,
              dry_run_tripped ? "true" : "false",
              Modbus_IsDataValid() ? 1 : 0,
              (int)Modbus_GetLastRx(),
@@ -335,17 +330,17 @@ static void run_protection(void)
     bool uv = (v1 < V_UNDERVOLTAGE || v2 < V_UNDERVOLTAGE || v3 < V_UNDERVOLTAGE);
     bool pl = (v1 < V_PHASE_LOSS || v2 < V_PHASE_LOSS || v3 < V_PHASE_LOSS);
 
-    /* immediate trip on voltage fault */
+    /* voltage protection disabled until meter wiring verified
     if ((ov || uv || pl) && relay1)
     {
         Relay1_Set(false);
-        Relay2_Set(true); /* relay2 = alarm */
+        Relay2_Set(true);
         publish_alert(ov, uv, pl, false);
         Debug_Print("[PROT] Voltage fault — pump OFF\r\n");
         return;
-    }
+    } */
 
-    /* dry run detection */
+    /* dry run detection disabled until current sensor wiring verified
     if (relay1 && !dry_run_tripped)
     {
         if (i < DRY_RUN_AMPS)
@@ -367,7 +362,6 @@ static void run_protection(void)
         }
     }
 
-    /* clear lockout after timeout */
     if (dry_run_tripped && HAL_GetTick() >= lockout_until)
     {
         dry_run_tripped = false;
@@ -375,7 +369,7 @@ static void run_protection(void)
         Relay2_Set(false);
         publish_alert(false, false, false, false);
         Debug_Print("[PROT] Lockout cleared\r\n");
-    }
+    } */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -416,6 +410,7 @@ static bool extract_str(const char *json, const char *key, char *out, size_t max
 }
 
 static void modem_ota_start(const char *url); /* forward declaration */
+static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Line processor — called for every complete line received from EC200U
@@ -791,14 +786,6 @@ static void process_line(const char *line)
         if (strstr(line, "+QMTSUB: 0,2,0"))
         {
             /* OTA topic subscribed — fully connected now */
-            /* DIAGNOSTIC: relay ON for 2 s then OFF */
-            Relay1_Set(true);
-            HAL_IWDG_Refresh(&hiwdg);
-            HAL_Delay(2000);
-            HAL_IWDG_Refresh(&hiwdg);
-            Relay1_Set(false);
-            HAL_Delay(300); HAL_IWDG_Refresh(&hiwdg);
-
             Debug_Print("[MQTT] Subscribed to " TOPIC_OTA "\r\n");
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
@@ -823,6 +810,7 @@ static void process_line(const char *line)
             prev_relay2       = relay2;
             prev_dry_run_trip = dry_run_tripped;
             last_heartbeat_ms = HAL_GetTick();
+            modem_cmd("AT+CSQ"); /* seed rssi before first publish */
             publish_status();
         }
         break;
@@ -885,12 +873,86 @@ static void process_line(const char *line)
     }
 }
 
+/* Last non-empty line seen by modem_sync_expect — used in error messages */
+static char modem_last_resp[64];
+
+/* ── Synchronous line reader — polls UART until a line containing `expected`
+ * is received, or ERROR, or timeout.  Returns true on match.
+ * Refreshes IWDG every 1 ms so the watchdog never fires during the wait.
+ * Sets modem_last_resp to the last non-empty line received (or "timeout").  */
+static bool modem_sync_expect(const char *expected, uint32_t timeout_ms)
+{
+    char     linebuf[64];
+    int      lpos = 0;
+    uint32_t t0   = HAL_GetTick();
+    modem_last_resp[0] = '\0';
+    while (HAL_GetTick() - t0 < timeout_ms) {
+        HAL_IWDG_Refresh(&hiwdg);
+        uint8_t c;
+        if (HAL_UART_Receive(modem_uart, &c, 1, 1) != HAL_OK) continue;
+        if (c == '\r') continue;
+        if (c == '\n') {
+            linebuf[lpos] = '\0';
+            if (lpos > 0) {
+                strncpy(modem_last_resp, linebuf, sizeof(modem_last_resp) - 1);
+                modem_last_resp[sizeof(modem_last_resp) - 1] = '\0';
+                if (strstr(linebuf, expected)) return true;
+                if (strstr(linebuf, "ERROR"))  return false;
+            }
+            lpos = 0;
+        } else if (lpos < (int)sizeof(linebuf) - 1) {
+            linebuf[lpos++] = (char)c;
+        }
+    }
+    strncpy(modem_last_resp, "timeout", sizeof(modem_last_resp) - 1);
+    return false; /* timeout */
+}
+
 /* ── OTA trigger helper — re-applies HTTP config before each download ────── */
 static void modem_ota_start(const char *url)
 {
-    /* Re-apply SSL context 1 — AT+QIDEACT resets QSSLCFG RAM settings.
-     * Without this, subsequent OTAs fail with SSL handshake timeout on
-     * GitHub CDN (objects.githubusercontent.com).                        */
+    /* ── PHASE 1: everything done while MQTT is still connected ──────────────
+     *
+     * Key insight: AT+QHTTPURL only stores the URL in RAM — it does NOT start
+     * a TLS handshake or any network activity.  The TLS/TCP connection only
+     * happens later during AT+QHTTPGET.
+     *
+     * By doing SSL config, QHTTPCFG, and QHTTPURL while MQTT is connected, any
+     * failure (ERROR / timeout) can be published to Firebase immediately via the
+     * live MQTT connection — no reconnect cycle needed.
+     *
+     * AT+QHTTPGET is the only command that cannot coexist with MQTT TLS
+     * (EC200U cannot run two simultaneous TLS sessions), so MQTT disconnect
+     * is deferred until just before AT+QHTTPGET.                            */
+
+    /* Publish "starting" — tells bridge.js to clear the retained OTA message
+     * on pump/01/ota so the board doesn't re-trigger OTA on every reconnect. */
+    if (mqtt_state == MQTT_STATE_CONNECTED) {
+        const char *ota_payload = "{\"ota_status\":\"starting\"}";
+        char pub_cmd[80];
+        snprintf(pub_cmd, sizeof(pub_cmd),
+                 "AT+QMTPUBEX=0,0,0,0,\"pump/01/ota/status\",%d",
+                 (int)strlen(ota_payload));
+        modem_cmd(pub_cmd);
+        uint8_t c;
+        uint32_t t0 = HAL_GetTick();
+        bool got_prompt = false;
+        while (HAL_GetTick() - t0 < 3000) {
+            if (HAL_UART_Receive(modem_uart, &c, 1, 5) == HAL_OK && c == '>') {
+                got_prompt = true; break;
+            }
+        }
+        if (got_prompt) {
+            HAL_UART_Transmit(modem_uart, (uint8_t*)ota_payload,
+                              strlen(ota_payload), 1000);
+            HAL_Delay(500);
+        }
+        HAL_IWDG_Refresh(&hiwdg);
+    }
+
+    /* SSL context 1 — used by HTTP client (independent of context 0 = MQTT).
+     * Re-applied here because AT+QIDEACT (from a previous reconnect) resets
+     * QSSLCFG RAM settings.                                                 */
     modem_cmd("AT+QSSLCFG=\"sslversion\",1,4");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
@@ -900,23 +962,97 @@ static void modem_ota_start(const char *url)
     modem_cmd("AT+QSSLCFG=\"seclevel\",1,0");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
-    /* AT+QHTTPCFG settings are also lost after PDP deactivation/activation. */
     modem_cmd("AT+QHTTPCFG=\"sslctxid\",1");
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+    /* Without "ssl",1 the HTTP client uses plain TCP even for https:// URLs.
+     * The TLS handshake never happens and GitHub returns a connection error. */
+    modem_cmd("AT+QHTTPCFG=\"ssl\",1");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QHTTPCFG=\"redirect\",1");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
-    OTA_Start(url);
+
+    /* Stop any lingering HTTP session and delete any leftover file from a
+     * previous failed OTA attempt.  AT+QHTTPGET writes to "HTTP_GETFILE" on
+     * the modem's UFS; if that file already exists the modem may truncate or
+     * return wrong data.  Errors from both commands are silently ignored.    */
+    modem_cmd("AT+QHTTPSTOP");
+    HAL_Delay(500);
+    HAL_IWDG_Refresh(&hiwdg);
+    modem_cmd("AT+QFDEL=\"HTTP_GETFILE\"");
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
+    HAL_IWDG_Refresh(&hiwdg);
+
+    /* Set URL.  Use a 5-second input window so the modem exits URL-input mode
+     * before modem_sync_expect (10 s) returns — keeps the modem in a clean
+     * command-mode state on failure.                                         */
+    char urlcmd[32];
+    snprintf(urlcmd, sizeof(urlcmd), "AT+QHTTPURL=%d,5", (int)strlen(url));
+    modem_cmd(urlcmd);
+
+    if (!modem_sync_expect("CONNECT", 10000)) {
+        /* URL setup failed — MQTT is still connected.  Publish error directly
+         * via queue_publish so it appears in Firebase within seconds.
+         * No reconnect needed; just return and let the main loop resume.    */
+        char errbuf[80];
+        snprintf(errbuf, sizeof(errbuf),
+                 "{\"ota_status\":\"error\",\"reason\":\"no CONNECT: %s\"}", modem_last_resp);
+        pub_pending = false;
+        queue_publish("pump/01/ota/status", errbuf);
+        return;   /* MQTT still connected — normal operation resumes         */
+    }
+
+    /* Send URL bytes (no \r\n — modem counts exact bytes) */
+    Modem_Send(url);
+    HAL_IWDG_Refresh(&hiwdg);
+
+    if (!modem_sync_expect("OK", 10000)) {
+        char errbuf[80];
+        snprintf(errbuf, sizeof(errbuf),
+                 "{\"ota_status\":\"error\",\"reason\":\"URL rejected: %s\"}", modem_last_resp);
+        pub_pending = false;
+        queue_publish("pump/01/ota/status", errbuf);
+        return;   /* MQTT still connected                                    */
+    }
+    HAL_IWDG_Refresh(&hiwdg);
+
+    /* ── PHASE 2: URL accepted — disconnect MQTT, then start download ───────
+     * Only AT+QHTTPGET requires MQTT disconnect (two simultaneous TLS sessions
+     * are not supported).  Disconnect as late as possible so any future error
+     * in ota.c can be published when MQTT auto-reconnects.                  */
+    modem_cmd("AT+QMTDISC=0");
+    HAL_Delay(500);
+    HAL_IWDG_Refresh(&hiwdg);
+    modem_cmd("AT+QMTCLOSE=0");
+    HAL_Delay(3000);
+    HAL_IWDG_Refresh(&hiwdg);
+    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+    mqtt_state = MQTT_STATE_DISCONNECTED;
+    HAL_IWDG_Refresh(&hiwdg);
+
+    /* URL accepted — enter OTA state machine at the HTTP GET phase */
+    OTA_StartFromGet(url);
 }
 
 /* ── OTA publish callback — lets ota.c publish via MQTT ─────────────────── */
 static void modem_ota_publish(const char *topic, const char *payload)
 {
-    /* OTA status is higher priority than any queued heartbeat/alert.
-     * Clear any pending publish so OTA messages are never silently dropped. */
+    (void)topic;  /* topic always pump/01/ota/status — matches ota_error_msg path */
+
+    /* OTA error messages must survive MQTT disconnect+reconnect.
+     * The reconnect code clears pub_pending (drops unsent messages), so any
+     * OTA error published while MQTT is down would be permanently lost.
+     * Save all OTA publishes to ota_error_msg so they survive reconnect and
+     * are published by the CONNECTED check in Modem_Process.                */
+    strncpy(ota_error_msg, payload, sizeof(ota_error_msg) - 1);
+    ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
+
     pub_pending = false;
-    queue_publish(topic, payload);
+    queue_publish("pump/01/ota/status", payload);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -966,6 +1102,11 @@ void Modem_Init(UART_HandleTypeDef *huart)
     HAL_Delay(300);
     modem_cmd("AT+QHTTPCFG=\"redirect\",1");
     HAL_Delay(300);
+
+    /* Cancel any lingering HTTP session (may be left over from a failed OTA).
+     * Must be done BEFORE AT+QMTCLOSE so the SSL subsystem is fully released. */
+    modem_cmd("AT+QHTTPSTOP");
+    HAL_Delay(500);
 
     /* Close any lingering MQTT session and PDP context FIRST.
      * AT+QMTCLOSE reloads NVM MQTT config — so ALL AT+QMTCFG commands must
@@ -1156,6 +1297,13 @@ void Modem_Process(void)
         }
     }
 
+    /* ── send OTA error (saved across reconnect) as soon as MQTT is up ── */
+    if (ota_error_msg[0] && mqtt_state == MQTT_STATE_CONNECTED && !pub_pending)
+    {
+        queue_publish("pump/01/ota/status", ota_error_msg);
+        ota_error_msg[0] = '\0';
+    }
+
     /* ── send queued publish when connected and idle (not during OTA) ── */
     if (pub_pending && mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())
     {
@@ -1168,8 +1316,8 @@ void Modem_Process(void)
         state_entered_ms = HAL_GetTick();
     }
 
-    /* ── auto-reconnect ── */
-    if (mqtt_state == MQTT_STATE_DISCONNECTED)
+    /* ── auto-reconnect (not during OTA — would disrupt HTTP download) ── */
+    if (mqtt_state == MQTT_STATE_DISCONNECTED && !OTA_IsActive())
     {
         static uint32_t last_reconnect = 0;
         if (HAL_GetTick() - last_reconnect > 10000)
@@ -1181,6 +1329,15 @@ void Modem_Process(void)
             HAL_IWDG_Refresh(&hiwdg);
             qmtopen_tls_seen = false;
             Debug_Print("[MQTT] Reconnecting...\r\n");
+            /* Stop any active HTTP session BEFORE closing MQTT and deactivating
+             * the PDP bearer.  After a failed OTA, the HTTP context may still be
+             * "open" (QHTTPCFG configured, partial QHTTPURL).  AT+QIDEACT fails
+             * silently when an HTTP session is active, leaving the PDP in a bad
+             * state and preventing MQTT from ever reconnecting.
+             * Modem_Init already does this; we must mirror it here.            */
+            modem_cmd("AT+QHTTPSTOP");
+            HAL_Delay(500);
+            HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QMTCLOSE=0");
             HAL_Delay(1500);
             HAL_IWDG_Refresh(&hiwdg);
