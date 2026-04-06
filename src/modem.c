@@ -1081,8 +1081,12 @@ void Modem_Init(UART_HandleTypeDef *huart)
     Debug_Print("[MODEM] Broker  : " BROKER_HOST "\r\n");
     Debug_Print("[MODEM] Waiting for EC200U ready...\r\n");
 
-    /* Give EC200U 5 s to boot, then send AT to wake it */
-    HAL_Delay(5000);
+    /* Give EC200U 5 s to boot, then send AT to wake it.
+     * Pet the IWDG in 500 ms chunks: after OTA NVIC_SystemReset the watchdog
+     * is already running (persists through reset), and a single HAL_Delay(5000)
+     * would fire it before MX_IWDG_Init runs.  Writing 0xAAAA to IWDG->KR is
+     * safe even before IWDG is initialised — it only reloads the counter.   */
+    for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
     modem_cmd("AT");
     HAL_Delay(300);
     modem_cmd("ATE0"); /* echo off */
@@ -1112,6 +1116,8 @@ void Modem_Init(UART_HandleTypeDef *huart)
     HAL_Delay(300);
     modem_cmd("AT+QHTTPCFG=\"redirect\",1");
     HAL_Delay(300);
+
+    IWDG->KR = 0xAAAAU;   /* ~3 s elapsed since last pet — refresh before long delays */
 
     /* Cancel any lingering HTTP session (may be left over from a failed OTA).
      * Must be done BEFORE AT+QMTCLOSE so the SSL subsystem is fully released. */
