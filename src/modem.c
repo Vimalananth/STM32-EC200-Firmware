@@ -1130,9 +1130,11 @@ void Modem_Init(UART_HandleTypeDef *huart)
     modem_cmd("AT+QMTCLOSE=0");
     HAL_Delay(1500);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+    IWDG->KR = 0xAAAAU;   /* pet after QMTCLOSE — 2 s since last pet */
     modem_cmd("AT+QIDEACT=1");
     HAL_Delay(2000);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+    IWDG->KR = 0xAAAAU;   /* pet after QIDEACT — 2 s since last pet */
 
     /* Configure MQTT client AFTER QMTCLOSE so NVM reload can't undo these.  */
     modem_cmd("AT+QMTCFG=\"ssl\",0,1,0");       /* MQTT client 0 → SSL context 0  */
