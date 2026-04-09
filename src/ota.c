@@ -172,7 +172,7 @@ static bool flash_write_chunk(uint32_t addr, const uint8_t *buf, uint32_t len)
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 void OTA_Init(void)     { ota_state = OTA_ST_IDLE; }
-bool OTA_IsActive(void) { return ota_state != OTA_ST_IDLE && ota_state != OTA_ST_ERROR && ota_state != OTA_ST_REBOOT; }
+bool OTA_IsActive(void) { return ota_state != OTA_ST_IDLE && ota_state != OTA_ST_ERROR; }
 bool OTA_BinaryPending(void) { return ota_bin_expect > 0; }
 
 void OTA_SetSendFn(OTA_SendFn fn)       { ota_send_fn    = fn; }
@@ -542,8 +542,20 @@ void OTA_Process(void)
     }
 
     case OTA_ST_REBOOT:
-        /* Wait 1 s so the MQTT publish can complete, then reset */
+        /* Wait 1 s so the MQTT publish can complete, then tear down the
+         * EC200U HTTP/TLS session and PDP context BEFORE resetting.
+         * Without this, the modem's TLS heap remains fragmented from the
+         * HTTPS download and AT+QMTOPEN cannot allocate SSL buffers on the
+         * next boot — causing the post-OTA MQTT reconnect to fail silently.
+         * Power-cycling always works because the modem fully reinitialises;
+         * this replicates that cleanup while keeping the STM32 in control. */
         if (HAL_GetTick() - ota_state_ms >= 1000) {
+            /* Stop the HTTP session — releases TLS context 1 heap */
+            ota_send("AT+QHTTPSTOP");
+            for (int i = 0; i < 6; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }   /* 3 s */
+            /* Deactivate PDP — forces complete bearer teardown */
+            ota_send("AT+QIDEACT=1");
+            for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }  /* 5 s */
             NVIC_SystemReset();
         }
         break;

@@ -131,6 +131,14 @@ static bool qicsgp_sent = false;
  * stale OK responses from AT+QMTCLOSE/AT+QIDEACT for QIACT's OK.          */
 static bool qiact_sent = false;
 
+/* set true on first AT+QIACT=1 ERROR so the handler force-deactivates and
+ * retries once before falling back to NET_WAIT.  Reset on PDP_ACTIVATE entry
+ * and on success.  Fixes the post-OTA loop: QIDEACT may silently fail in
+ * Modem_Init if HTTP is still closing, leaving the PDP context active.
+ * EC200U returns ERROR (not OK) when AT+QIACT=1 is sent on an already-active
+ * context, which previously caused an infinite NET_WAIT/PDP loop.           */
+static bool qiact_retry_done = false;
+
 /* set true when +QMTOPEN: 0,"hostname",port URC arrives (TLS handshake
  * started).  Success fires only on the subsequent OK (TLS complete).     */
 static bool qmtopen_tls_seen = false;
@@ -595,7 +603,8 @@ static void process_line(const char *line)
             Debug_Print("[NET] Registered\r\n");
             mqtt_state = MQTT_STATE_PDP_OPEN;
             state_entered_ms = HAL_GetTick();
-            qicsgp_sent = false; /* Modem_Process sends QICSGP after buffer drains */
+            qicsgp_sent      = false; /* Modem_Process sends QICSGP after buffer drains */
+            qiact_retry_done = false; /* reset retry flag for fresh PDP_ACTIVATE attempt */
         }
         /* retry registration every 5s */
         if (HAL_GetTick() - state_entered_ms > 5000)
@@ -631,6 +640,7 @@ static void process_line(const char *line)
         if (strstr(line, "OK") && qiact_sent)
         {
             Debug_Print("[NET] PDP active — opening broker\r\n");
+            qiact_retry_done = false;
             mqtt_state = MQTT_STATE_BROKER_OPEN;
             state_entered_ms = HAL_GetTick();
 
@@ -641,9 +651,29 @@ static void process_line(const char *line)
         }
         if (strstr(line, "ERROR"))
         {
-            Debug_Print("[NET] PDP activate error — retrying\r\n");
-            mqtt_state = MQTT_STATE_NET_WAIT;
-            state_entered_ms = HAL_GetTick();
+            if (!qiact_retry_done)
+            {
+                /* EC200U returns ERROR when AT+QIACT=1 is sent on an already-
+                 * active context (e.g., after OTA reboot where QIDEACT in
+                 * Modem_Init failed because HTTP was still closing).
+                 * Force-deactivate and retry QIACT once before giving up.   */
+                qiact_retry_done = true;
+                Debug_Print("[NET] QIACT error — force QIDEACT and retry\r\n");
+                modem_cmd("AT+QIDEACT=1");
+                HAL_Delay(2000);
+                HAL_IWDG_Refresh(&hiwdg);
+                { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+                qiact_sent = false;        /* Modem_Process will send QIACT=1 again */
+                state_entered_ms = HAL_GetTick(); /* reset 30 s timeout           */
+            }
+            else
+            {
+                /* Retry also failed — give up and restart from NET_WAIT */
+                qiact_retry_done = false;
+                Debug_Print("[NET] PDP activate failed (retry exhausted) — restarting\r\n");
+                mqtt_state = MQTT_STATE_NET_WAIT;
+                state_entered_ms = HAL_GetTick();
+            }
         }
         /* 30 s timeout — QIACT sometimes silently fails */
         if (HAL_GetTick() - state_entered_ms > 30000)
@@ -1081,25 +1111,37 @@ void Modem_Init(UART_HandleTypeDef *huart)
     Debug_Print("[MODEM] Broker  : " BROKER_HOST "\r\n");
     Debug_Print("[MODEM] Waiting for EC200U ready...\r\n");
 
-    /* Give EC200U 5 s to boot, then send AT to wake it.
-     * Pet the IWDG in 500 ms chunks: after OTA NVIC_SystemReset the watchdog
-     * is already running (persists through reset), and a single HAL_Delay(5000)
-     * would fire it before MX_IWDG_Init runs.  Writing 0xAAAA to IWDG->KR is
-     * safe even before IWDG is initialised — it only reloads the counter.   */
-    for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+    /* Detect software reset (NVIC_SystemReset after OTA) vs cold power-on.
+     * RCC_CSR_SFTRSTF is set by NVIC_SystemReset; PORRSTF is set on power-on.
+     * Used below to choose the initial MQTT state. */
+    bool ota_reboot = (RCC->CSR & RCC_CSR_SFTRSTF) != 0;
+    RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
+
+    if (ota_reboot) {
+        /* ota.c sent AT+QHTTPSTOP + AT+QIDEACT before NVIC_SystemReset,
+         * so EC200U continues running with a clean state: no active PDP,
+         * HTTP session, or MQTT connection, and TLS heap freed.
+         * AT+CFUN=1,1 is NOT needed — 10 s settle is enough.
+         * OTA_IsActive() now returns true during OTA_ST_REBOOT, so the
+         * DISCONNECTED reconnect cannot fire and interfere with cleanup.  */
+        Debug_Print("[MODEM] OTA reboot — 10s settle wait\r\n");
+        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+        IWDG->KR = 0xAAAAU;
+        Debug_Print("[MODEM] OTA settle complete\r\n");
+    } else {
+        /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
+        for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+    }
     modem_cmd("AT");
     HAL_Delay(300);
     modem_cmd("ATE0"); /* echo off */
     HAL_Delay(300);
-
-    /* SSL config first — not affected by QMTCLOSE */
-    modem_cmd("AT+QSSLCFG=\"sslversion\",0,4"); /* 4 = ALL TLS versions (ref code) */
-    HAL_Delay(300);
-    modem_cmd("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF"); /* all cipher suites        */
-    HAL_Delay(300);
-    modem_cmd("AT+QSSLCFG=\"seclevel\",0,0");   /* 0=no cert verify (EMQX free tier uses self-signed) */
-    HAL_Delay(300);
-    modem_cmd("AT+QSSLCFG=\"sni\",0,\"" BROKER_HOST "\""); /* SNI routing (lowercase!) */
+    /* Lock CEREG URC mode to 0 so AT+CEREG? always returns "+CEREG: 0,<stat>".
+     * After an OTA reboot the modem may retain mode=1 or 2 from a previous
+     * session, changing the response format and preventing NET_WAIT from
+     * recognising the registration status.                                   */
+    modem_cmd("AT+CEREG=0");
     HAL_Delay(300);
 
     /* SSL context 1 — used by HTTP client for HTTPS OTA downloads.
@@ -1122,7 +1164,9 @@ void Modem_Init(UART_HandleTypeDef *huart)
     /* Cancel any lingering HTTP session (may be left over from a failed OTA).
      * Must be done BEFORE AT+QMTCLOSE so the SSL subsystem is fully released. */
     modem_cmd("AT+QHTTPSTOP");
-    HAL_Delay(500);
+    HAL_Delay(2000);            /* was 500 ms — after OTA the HTTP session needs
+                                 * extra time to fully close before QIDEACT.    */
+    IWDG->KR = 0xAAAAU;        /* pet: 2 s elapsed since pet before QHTTPSTOP  */
 
     /* Close any lingering MQTT session and PDP context FIRST.
      * AT+QMTCLOSE reloads NVM MQTT config — so ALL AT+QMTCFG commands must
@@ -1132,9 +1176,29 @@ void Modem_Init(UART_HandleTypeDef *huart)
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
     IWDG->KR = 0xAAAAU;   /* pet after QMTCLOSE — 2 s since last pet */
     modem_cmd("AT+QIDEACT=1");
-    HAL_Delay(2000);
+    /* Wait up to 40 s for the PDP context to fully deactivate (Quectel max spec).
+     * modem_sync_expect pets IWDG every 1 ms so the watchdog cannot fire.
+     * After OTA the modem may take several seconds to tear down the HTTP/TLS
+     * session before it can release the PDP bearer — a fixed 2 s delay was not
+     * enough, leaving the context ACTIVE and causing QIACT=1 to return ERROR. */
+    modem_sync_expect("OK", 40000);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
-    IWDG->KR = 0xAAAAU;   /* pet after QIDEACT — 2 s since last pet */
+    IWDG->KR = 0xAAAAU;
+
+    /* Re-apply SSL context 0 AFTER QMTCLOSE+QIDEACT.
+     * AT+QMTCLOSE reloads NVM MQTT config which may reset QSSLCFG context 0
+     * settings (seclevel, ciphersuite, SNI) back to factory defaults.
+     * Placing these here guarantees they are set correctly regardless of any
+     * NVM reload, and they survive until AT+QMTOPEN is called.              */
+    modem_cmd("AT+QSSLCFG=\"sslversion\",0,4");
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF");
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"seclevel\",0,0");   /* no cert verify — EMQX self-signed */
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"sni\",0,\"" BROKER_HOST "\"");
+    HAL_Delay(300);
+    IWDG->KR = 0xAAAAU;   /* pet: 4×300 ms = 1.2 s since last pet              */
 
     /* Configure MQTT client AFTER QMTCLOSE so NVM reload can't undo these.  */
     modem_cmd("AT+QMTCFG=\"ssl\",0,1,0");       /* MQTT client 0 → SSL context 0  */
@@ -1161,12 +1225,16 @@ void Modem_Init(UART_HandleTypeDef *huart)
     OTA_SetSendFn(Modem_Send);
     OTA_SetPublishFn(modem_ota_publish);
 
-    /* Skip BOOT state — go directly to NET_WAIT.
-     * Send AT+CEREG? now; its response arrives after Modem_Process starts
-     * polling, avoiding any UART overflow / ORE timing issues.             */
-    mqtt_state        = MQTT_STATE_NET_WAIT;
-    state_entered_ms  = HAL_GetTick();
-    modem_cmd("AT+CEREG?");   /* LTE registration query                     */
+    /* PDP is now deactivated (modem_sync_expect confirmed OK above).
+     * Use the same NET_WAIT path for both cold boot and OTA reboot.
+     * NET_WAIT polls CEREG until LTE is registered, then NET_WAIT→PDP_OPEN
+     * sends QICSGP to configure the APN — QIACT=1 requires a valid APN
+     * context configuration even after a previous QIDEACT.              */
+    if (ota_reboot)
+        Debug_Print("[MODEM] OTA reboot — PDP deactivated, going to NET_WAIT\r\n");
+    mqtt_state       = MQTT_STATE_NET_WAIT;
+    state_entered_ms = HAL_GetTick();
+    modem_cmd("AT+CEREG?");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1387,11 +1455,27 @@ void Modem_Process(void)
             }
             recv_payload_pending = false; /* clear stale recv state           */
             pub_pending          = false; /* drop unsent publish              */
+            /* Re-apply SSL context 0 after QMTCLOSE — NVM reload may have
+             * reset seclevel/ciphersuite/SNI back to factory defaults,
+             * causing TLS handshake to fail when QMTOPEN is sent.          */
+            modem_cmd("AT+QSSLCFG=\"sslversion\",0,4");
+            HAL_Delay(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF");
+            HAL_Delay(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"seclevel\",0,0");
+            HAL_Delay(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"sni\",0,\"" BROKER_HOST "\"");
+            HAL_Delay(300);
+            HAL_IWDG_Refresh(&hiwdg);
             /* APN already configured — skip QICSGP, go straight to QIACT.
              * Modem_Process sends AT+QIACT=1 after the buffer is drained
              * so stale OK from QMTCLOSE/QIDEACT above is not misread.      */
-            mqtt_state = MQTT_STATE_PDP_ACTIVATE;
-            qiact_sent = false;
+            mqtt_state       = MQTT_STATE_PDP_ACTIVATE;
+            qiact_sent       = false;
+            qiact_retry_done = false; /* fresh attempt — PDP just deactivated */
         }
     }
 
