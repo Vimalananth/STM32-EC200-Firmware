@@ -68,6 +68,11 @@ extern IWDG_HandleTypeDef hiwdg;
 #define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
 /* QoS0 PUBEX acks can arrive late when modem/network is busy. */
 #define MQTT_PUBACK_TIMEOUT_MS 12000UL
+/* Block immediate OTA retrigger for a while after modem reboot during OTA.
+ * This avoids retained pump/01/ota payload causing endless retry loops. */
+#define OTA_RETRY_BLOCK_MS 300000UL
+/* Raw line tracing is very chatty and can starve UART servicing at 9600 debug. */
+#define MODEM_TRACE_LINES 0
 
 /* ── RX buffer ──────────────────────────────────────────────────────────── */
 #define RX_BUF_SIZE 512
@@ -122,6 +127,7 @@ static bool     prev_dry_run_trip  = false;
 
 /* signal strength: updated by +CSQ response; 99 = unknown */
 static int8_t   last_rssi          = 99;
+static uint32_t ota_retry_block_until = 0;
 
 /* set false when PDP_OPEN is entered; set true when AT+QICSGP is sent from
  * Modem_Process (after the RX buffer is drained) so we never mistake the
@@ -147,6 +153,11 @@ static bool qmtopen_tls_seen = false;
 /* Set when unsolicited modem reboot URCs are seen (RDY/+CFUN: 1) so
  * Modem_Process can run a full Modem_Init() re-initialization. */
 static bool modem_reinit_pending = false;
+
+static bool ota_retry_blocked(void)
+{
+    return ((int32_t)(HAL_GetTick() - ota_retry_block_until) < 0);
+}
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -434,7 +445,7 @@ static void process_line(const char *line)
     char dbg[80];
 
     /* ── always log non-empty lines to debug UART ── */
-    if (line[0])
+    if (line[0] && MODEM_TRACE_LINES)
     {
         snprintf(dbg, sizeof(dbg), "[EC200U] %s\r\n", line);
         Debug_Print(dbg);
@@ -478,6 +489,10 @@ static void process_line(const char *line)
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
             {
+                if (ota_retry_blocked()) {
+                    Debug_Print("[OTA] Ignored trigger (cooldown after reboot)\r\n");
+                    return;
+                }
                 modem_ota_start(ota_url);
                 return;
             }
@@ -515,6 +530,10 @@ static void process_line(const char *line)
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
             {
+                if (ota_retry_blocked()) {
+                    Debug_Print("[OTA] Ignored trigger (cooldown after reboot)\r\n");
+                    return;
+                }
                 modem_ota_start(ota_url);
                 return;
             }
@@ -1125,6 +1144,9 @@ static void modem_ota_publish(const char *topic, const char *payload)
      * are published by the CONNECTED check in Modem_Process.                */
     strncpy(ota_error_msg, payload, sizeof(ota_error_msg) - 1);
     ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
+
+    if (strstr(payload, "modem rebooted during ota"))
+        ota_retry_block_until = HAL_GetTick() + OTA_RETRY_BLOCK_MS;
 
     pub_pending = false;
     queue_publish("pump/01/ota/status", payload);
