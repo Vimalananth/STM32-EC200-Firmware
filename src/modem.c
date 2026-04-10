@@ -1450,6 +1450,13 @@ void Modem_Process(void)
             HAL_Delay(300);
             modem_cmd("AT+QMTCFG=\"will\",0,0");
             HAL_Delay(300);
+            /* QMTCLOSE reloads NVM which resets ssl to factory default (0=disabled).
+             * Without this, QMTOPEN uses plain TCP on port 8883 (TLS expected) and
+             * fails silently every reconnect cycle — confirmed root cause of
+             * post-OTA MQTT never connecting.                                   */
+            modem_cmd("AT+QMTCFG=\"ssl\",0,1,0"); /* MQTT ctx 0 → SSL ctx 0    */
+            HAL_Delay(300);
+            HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QIDEACT=1");
             HAL_Delay(1500);
             HAL_IWDG_Refresh(&hiwdg);
