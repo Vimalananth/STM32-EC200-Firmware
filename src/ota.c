@@ -25,6 +25,7 @@ extern IWDG_HandleTypeDef hiwdg;
 
 /* ── Private config ─────────────────────────────────────────────────────── */
 #define OTA_CHUNK_SIZE   256U          /* bytes per AT+QFREAD request       */
+#define OTA_HTTP_FILE    "UFS:HTTP_GETFILE"
 #define OTA_STATUS_TOPIC "pump/01/ota/status"
 #define OTA_PROGRESS_EVERY (4096U)     /* publish progress every 4 KB       */
 #define OTA_CMD_TIMEOUT_MS 120000UL  /* 120 s for HTTP GET; modem given 110 s (see OTA_StartFromGet) */
@@ -42,7 +43,8 @@ typedef enum {
     OTA_ST_HTTP_URL_CMD,    /* sent AT+QHTTPURL, waiting for CONNECT prompt  */
     OTA_ST_HTTP_URL_BODY,   /* sent URL text, waiting for OK                 */
     OTA_ST_HTTP_GET,        /* sent AT+QHTTPGET, waiting for +QHTTPGET URC   */
-    OTA_ST_FILE_OPEN,       /* sent AT+QFOPEN, waiting for +QFOPEN: 0        */
+    OTA_ST_HTTP_READFILE,   /* sent AT+QHTTPREADFILE, waiting completion     */
+    OTA_ST_FILE_OPEN,       /* sent AT+QFOPEN, waiting for +QFOPEN handle    */
     OTA_ST_CHUNK_READ,      /* sent AT+QFREAD, waiting for CONNECT N header  */
     OTA_ST_CHUNK_BINARY,    /* receiving N raw bytes via OTA_FeedByte()      */
     OTA_ST_CHUNK_FLASH,     /* writing chunk to App Slot B                   */
@@ -61,6 +63,7 @@ static uint32_t     ota_crc32        = 0xFFFFFFFFUL;
 static uint32_t     ota_last_progress= 0;     /* offset at last progress publish */
 static uint32_t     ota_state_ms     = 0;     /* time entered current state      */
 static uint32_t     ota_timeout_ms   = 0;
+static int          ota_file_handle  = -1;
 
 /* Binary accumulation buffer (for AT+QFREAD raw response) */
 static uint8_t      ota_bin_buf[OTA_CHUNK_SIZE];
@@ -121,6 +124,33 @@ static void ota_error(const char *reason)
     char dbg[64];
     snprintf(dbg, sizeof(dbg), "[OTA] Error: %s\r\n", reason);
     Debug_Print(dbg);
+}
+
+static bool ota_have_file_handle(void)
+{
+    if (ota_file_handle >= 0)
+        return true;
+    ota_error("bad file handle");
+    return false;
+}
+
+static void ota_send_read_chunk(void)
+{
+    char cmd[48];
+    if (!ota_have_file_handle())
+        return;
+    snprintf(cmd, sizeof(cmd), "AT+QFREAD=%d,%u",
+             ota_file_handle, (unsigned)OTA_CHUNK_SIZE);
+    ota_send(cmd);
+}
+
+static void ota_send_close_file(void)
+{
+    char cmd[32];
+    if (!ota_have_file_handle())
+        return;
+    snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", ota_file_handle);
+    ota_send(cmd);
 }
 
 /* ── Flash write helpers ─────────────────────────────────────────────────── */
@@ -207,6 +237,7 @@ void OTA_Start(const char *url)
     ota_last_progress= 0;
     ota_bin_expect   = 0;
     ota_bin_pos      = 0;
+    ota_file_handle  = -1;
 
     ota_publish("{\"ota_status\":\"starting\"}");
     ota_publish("{\"ota_test\":\"debug enabled\"}");  // Test to confirm code update
@@ -237,6 +268,7 @@ void OTA_StartFromGet(const char *url)
     ota_last_progress = 0;
     ota_bin_expect    = 0;
     ota_bin_pos       = 0;
+    ota_file_handle   = -1;
 
     /* Publish a "http_get" status so the error message saved in modem.c's
      * ota_error_msg shows we reached this stage.  This survives MQTT reconnect
@@ -371,16 +403,44 @@ void OTA_HandleLine(const char *line)
                          (unsigned long)ota_file_size);
                 ota_publish(msg);
             }
-            ota_send("AT+QFOPEN=\"HTTP_GETFILE\",0");
-            ota_enter(OTA_ST_FILE_OPEN, 5000);
+            {
+                char cmd[72];
+                snprintf(cmd, sizeof(cmd), "AT+QHTTPREADFILE=\"%s\",80", OTA_HTTP_FILE);
+                ota_send(cmd);
+                ota_enter(OTA_ST_HTTP_READFILE, OTA_CMD_TIMEOUT_MS);
+            }
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPGET failed");
         break;
 
+    case OTA_ST_HTTP_READFILE:
+        if (strstr(line, "+QHTTPREADFILE:")) {
+            const char *p = strchr(line, ':');
+            int err = p ? atoi(p + 1) : -1;
+            if (err != 0) {
+                ota_error("QHTTPREADFILE failed");
+                break;
+            }
+            {
+                char cmd[64];
+                snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", OTA_HTTP_FILE);
+                ota_send(cmd);
+                ota_enter(OTA_ST_FILE_OPEN, 5000);
+            }
+        }
+        if (strstr(line, "ERROR")) ota_error("QHTTPREADFILE failed");
+        break;
+
     case OTA_ST_FILE_OPEN:
-        if (strstr(line, "+QFOPEN: 0")) {
+        if (strstr(line, "+QFOPEN:")) {
+            const char *p = strchr(line, ':');
+            ota_file_handle = p ? atoi(p + 1) : -1;
+            if (ota_file_handle < 0) {
+                ota_error("QFOPEN bad handle");
+                break;
+            }
             /* File open; send first read request */
-            ota_send("AT+QFREAD=0,256");
+            ota_send_read_chunk();
             ota_enter(OTA_ST_CHUNK_READ, OTA_READ_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"File opened\"}");
         }
@@ -429,6 +489,7 @@ void OTA_Process(void)
                 case OTA_ST_HTTP_URL_CMD:  why = "no CONNECT";  break;
                 case OTA_ST_HTTP_URL_BODY: why = "no URL OK";   break;
                 case OTA_ST_HTTP_GET:      why = "http get TO"; break;
+                case OTA_ST_HTTP_READFILE: why = "readfile TO"; break;
                 case OTA_ST_FILE_OPEN:     why = "fopen TO";    break;
                 case OTA_ST_CHUNK_READ:    why = "chunk TO";    break;
                 case OTA_ST_CHUNK_BINARY:  why = "binary TO";   break;
@@ -491,11 +552,11 @@ void OTA_Process(void)
 
         /* More data to read? */
         if (ota_offset < ota_file_size) {
-            ota_send("AT+QFREAD=0,256");
+            ota_send_read_chunk();
             ota_enter(OTA_ST_CHUNK_READ, OTA_READ_TIMEOUT_MS);
         } else {
             /* All chunks received — close file */
-            ota_send("AT+QFCLOSE=0");
+            ota_send_close_file();
             ota_enter(OTA_ST_FILE_CLOSE, 5000);
             ota_publish("{\"ota_debug\":\"All chunks received, closing file\"}");
         }

@@ -1013,15 +1013,21 @@ static void modem_ota_start(const char *url)
     modem_cmd("AT+QHTTPCFG=\"redirect\",1");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
+    modem_cmd("AT+QHTTPCFG=\"responseheader\",0");
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+    modem_cmd("AT+QHTTPCFG=\"requestheader\",0");
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
 
     /* Stop any lingering HTTP session and delete any leftover file from a
-     * previous failed OTA attempt.  AT+QHTTPGET writes to "HTTP_GETFILE" on
-     * the modem's UFS; if that file already exists the modem may truncate or
-     * return wrong data.  Errors from both commands are silently ignored.    */
+     * previous failed OTA attempt.  AT+QHTTPREADFILE writes the GET response
+     * body to UFS:HTTP_GETFILE; delete it first so stale content cannot be
+     * flashed if the save step fails. Errors from both commands are ignored. */
     modem_cmd("AT+QHTTPSTOP");
     HAL_Delay(500);
     HAL_IWDG_Refresh(&hiwdg);
-    modem_cmd("AT+QFDEL=\"HTTP_GETFILE\"");
+    modem_cmd("AT+QFDEL=\"UFS:HTTP_GETFILE\"");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
