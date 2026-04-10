@@ -142,6 +142,9 @@ static bool qiact_retry_done = false;
 /* set true when +QMTOPEN: 0,"hostname",port URC arrives (TLS handshake
  * started).  Success fires only on the subsequent OK (TLS complete).     */
 static bool qmtopen_tls_seen = false;
+/* Set when unsolicited modem reboot URCs are seen (RDY/+CFUN: 1) so
+ * Modem_Process can run a full Modem_Init() re-initialization. */
+static bool modem_reinit_pending = false;
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -433,6 +436,15 @@ static void process_line(const char *line)
     {
         snprintf(dbg, sizeof(dbg), "[EC200U] %s\r\n", line);
         Debug_Print(dbg);
+    }
+
+    /* Modem restarted unexpectedly (brownout/reset): all runtime MQTT/SSL
+     * config is lost. Schedule a full Modem_Init() instead of partial retry. */
+    if ((strstr(line, "RDY") || strstr(line, "+CFUN: 1")) &&
+        mqtt_state != MQTT_STATE_BOOT)
+    {
+        modem_reinit_pending = true;
+        Debug_Print("[MODEM] Unsolicited modem reboot detected\r\n");
     }
 
     /* Forward ALL lines to OTA state machine during an active OTA download.
@@ -933,6 +945,21 @@ static bool modem_sync_expect(const char *expected, uint32_t timeout_ms)
     return false; /* timeout */
 }
 
+/* Send an AT command and wait for an OK response.
+ * Retries are used in Modem_Init because EC200U can still be settling
+ * for a short time after CFUN reset during post-OTA reboot. */
+static bool modem_sync_cmd_ok(const char *cmd, uint32_t timeout_ms, uint8_t retries)
+{
+    for (uint8_t i = 0; i < retries; i++) {
+        modem_cmd(cmd);
+        if (modem_sync_expect("OK", timeout_ms))
+            return true;
+        HAL_Delay(300);
+        HAL_IWDG_Refresh(&hiwdg);
+    }
+    return false;
+}
+
 /* ── OTA trigger helper — re-applies HTTP config before each download ────── */
 static void modem_ota_start(const char *url)
 {
@@ -1147,16 +1174,16 @@ void Modem_Init(UART_HandleTypeDef *huart)
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
     }
-    modem_cmd("AT");
-    HAL_Delay(300);
-    modem_cmd("ATE0"); /* echo off */
-    HAL_Delay(300);
+    if (!modem_sync_cmd_ok("AT", 2000, 15))
+        Debug_Print("[MODEM] WARN: AT sync failed, continuing\r\n");
+    if (!modem_sync_cmd_ok("ATE0", 2000, 5))
+        Debug_Print("[MODEM] WARN: ATE0 failed, continuing\r\n");
     /* Lock CEREG URC mode to 0 so AT+CEREG? always returns "+CEREG: 0,<stat>".
      * After an OTA reboot the modem may retain mode=1 or 2 from a previous
      * session, changing the response format and preventing NET_WAIT from
      * recognising the registration status.                                   */
-    modem_cmd("AT+CEREG=0");
-    HAL_Delay(300);
+    if (!modem_sync_cmd_ok("AT+CEREG=0", 2000, 5))
+        Debug_Print("[MODEM] WARN: CEREG mode set failed, continuing\r\n");
 
     /* SSL context 1 — used by HTTP client for HTTPS OTA downloads.
      * Must be separate from context 0 (MQTT) so the broker SNI doesn't
@@ -1317,6 +1344,17 @@ void Modem_Process(void)
             else
                 rxpos = 0; /* overflow guard */
         }
+    }
+
+    /* Full modem reset recovery path: re-run Modem_Init so SSL/MQTT config
+     * is restored before attempting any reconnect. */
+    if (modem_reinit_pending) {
+        modem_reinit_pending = false;
+        recv_payload_pending = false;
+        pub_pending = false;
+        OTA_Init();
+        Modem_Init(modem_uart);
+        return;
     }
 
     /* ── send AT+QIACT=1 after buffer is drained (avoids stale QMTCLOSE/QIDEACT OK) ── */

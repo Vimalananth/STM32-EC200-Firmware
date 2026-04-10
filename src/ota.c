@@ -298,6 +298,13 @@ void OTA_HandleLine(const char *line)
     snprintf(recv_msg, sizeof(recv_msg), "{\"ota_debug\":\"Received: %s\"}", line);
     ota_publish(recv_msg);
 
+    /* If the modem reboots while OTA is running, HTTP session state is lost.
+     * Abort immediately so modem.c can run a full modem re-init path. */
+    if (strstr(line, "RDY") || strstr(line, "+CFUN: 1")) {
+        ota_error("modem rebooted during ota");
+        return;
+    }
+
     /* Lines that matter in each state */
     switch (ota_state) {
 
