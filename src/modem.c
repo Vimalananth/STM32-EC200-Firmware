@@ -66,6 +66,8 @@ extern IWDG_HandleTypeDef hiwdg;
 
 /* ── Heartbeat interval (event-driven: also publish on every state change) ── */
 #define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
+/* QoS0 PUBEX acks can arrive late when modem/network is busy. */
+#define MQTT_PUBACK_TIMEOUT_MS 12000UL
 
 /* ── RX buffer ──────────────────────────────────────────────────────────── */
 #define RX_BUF_SIZE 512
@@ -1396,7 +1398,7 @@ void Modem_Process(void)
 
     /* ── PUB_WAIT_OK timeout — if +QMTPUBEX never arrives, back to CONNECTED ── */
     if (mqtt_state == MQTT_STATE_PUB_WAIT_OK &&
-        HAL_GetTick() - state_entered_ms > 5000)
+        HAL_GetTick() - state_entered_ms > MQTT_PUBACK_TIMEOUT_MS)
     {
         Debug_Print("[MQTT] PubWaitOK timeout — continuing\r\n");
         pub_pending = false;
