@@ -68,6 +68,8 @@ extern IWDG_HandleTypeDef hiwdg;
 #define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
 /* QoS0 PUBEX acks can arrive late when modem/network is busy. */
 #define MQTT_PUBACK_TIMEOUT_MS 12000UL
+#define OTA_POST_QMTCLOSE_DELAY_MS 8000UL
+#define OTA_HTTP_REDIRECT_ENABLED 0  /* firmware served from Railway — no redirect */
 /* Block immediate OTA retrigger for a while after modem reboot during OTA.
  * This avoids retained pump/01/ota payload causing endless retry loops. */
 #define OTA_RETRY_BLOCK_MS 300000UL
@@ -433,6 +435,27 @@ static bool extract_str(const char *json, const char *key, char *out, size_t max
     return (i > 0);
 }
 
+/* Accept OTA trigger payloads in either format:
+ *   {"url":"https://..."}   or   https://...
+ * Extract URL from any line containing http/https text. */
+static bool extract_ota_url_any(const char *text, char *out, size_t max)
+{
+    const char *p = strstr(text, "https://");
+    if (!p) p = strstr(text, "http://");
+    if (!p) return false;
+
+    size_t i = 0;
+    while (*p && i < max - 1) {
+        char c = *p;
+        if (c == '"' || c == ',' || c == ' ' || c == '\r' || c == '\n')
+            break;
+        out[i++] = c;
+        p++;
+    }
+    out[i] = '\0';
+    return (i > 0);
+}
+
 static void modem_ota_start(const char *url); /* forward declaration */
 static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
 
@@ -515,6 +538,16 @@ static void process_line(const char *line)
             }
             return;
         }
+        /* Plain URL payload on next line (non-JSON bridge format). */
+        {
+            char ota_url[200];
+            if (extract_ota_url_any(line, ota_url, sizeof(ota_url)))
+            {
+                recv_payload_pending = false;
+                modem_ota_start(ota_url);
+                return;
+            }
+        }
         /* "OK" ends an AT+QMTRECV exchange with no usable payload — clear flag */
         if (strcmp(line, "OK") == 0)
             recv_payload_pending = false;
@@ -556,7 +589,17 @@ static void process_line(const char *line)
                 Debug_Print(r2 ? "[CMD] Relay2 ON\r\n" : "[CMD] Relay2 OFF\r\n");
             }
         }
-        else if (strchr(line, '"'))
+        else
+        {
+            /* Inline non-JSON payload with URL in the same +QMTRECV line. */
+            char ota_url[200];
+            if (extract_ota_url_any(line, ota_url, sizeof(ota_url)))
+            {
+                modem_ota_start(ota_url);
+                return;
+            }
+        }
+        if (strchr(line, '"'))
         {
             /* Has quoted topic but no '{': response header from AT+QMTRECV.
              * Payload arrives on the next line.                             */
@@ -984,6 +1027,14 @@ static bool modem_sync_cmd_ok(const char *cmd, uint32_t timeout_ms, uint8_t retr
 /* ── OTA trigger helper — re-applies HTTP config before each download ────── */
 static void modem_ota_start(const char *url)
 {
+    /* Central cooldown guard: block OTA retrigger after modem reboot during OTA. */
+    if (ota_retry_blocked()) {
+        Debug_Print("[OTA] Trigger ignored (cooldown active)\r\n");
+        queue_publish("pump/01/ota/status",
+                      "{\"ota_status\":\"error\",\"reason\":\"ota cooldown active\"}");
+        return;
+    }
+
     /* ── PHASE 1: everything done while MQTT is still connected ──────────────
      *
      * Key insight: AT+QHTTPURL only stores the URL in RAM — it does NOT start
@@ -1058,7 +1109,8 @@ static void modem_ota_start(const char *url)
     modem_cmd("AT+QHTTPCFG=\"ssl\",1");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
-    modem_cmd("AT+QHTTPCFG=\"redirect\",1");
+    modem_cmd(OTA_HTTP_REDIRECT_ENABLED ? "AT+QHTTPCFG=\"redirect\",1"
+                                        : "AT+QHTTPCFG=\"redirect\",0");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QHTTPCFG=\"responseheader\",0");
@@ -1122,7 +1174,10 @@ static void modem_ota_start(const char *url)
     HAL_Delay(500);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QMTCLOSE=0");
-    HAL_Delay(3000);
+    /* Hint EC200 that MQTT context 0 no longer needs TLS memory before
+     * starting HTTPS context 1 for OTA. */
+    modem_cmd("AT+QMTCFG=\"ssl\",0,0");
+    HAL_Delay(OTA_POST_QMTCLOSE_DELAY_MS);
     HAL_IWDG_Refresh(&hiwdg);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
     mqtt_state = MQTT_STATE_DISCONNECTED;
@@ -1145,8 +1200,10 @@ static void modem_ota_publish(const char *topic, const char *payload)
     strncpy(ota_error_msg, payload, sizeof(ota_error_msg) - 1);
     ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
 
-    if (strstr(payload, "modem rebooted during ota"))
+    if (strstr(payload, "modem rebooted during ota")) {
         ota_retry_block_until = HAL_GetTick() + OTA_RETRY_BLOCK_MS;
+        Debug_Print("[OTA] Cooldown armed after modem reboot during OTA\r\n");
+    }
 
     pub_pending = false;
     queue_publish("pump/01/ota/status", payload);
