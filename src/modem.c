@@ -130,6 +130,10 @@ static bool     prev_dry_run_trip  = false;
 /* signal strength: updated by +CSQ response; 99 = unknown */
 static int8_t   last_rssi          = 99;
 static uint32_t ota_retry_block_until = 0;
+/* Grace period: suppress modem_reinit for 20s after Modem_Init returns.
+ * EC200U post-CFUN=1,1 boot may send late URCs (APP RDY) that arrive during
+ * the SSL/MQTT config phase — these must not trigger a spurious modem_reinit. */
+static uint32_t modem_init_grace_until = 0;
 
 /* set false when PDP_OPEN is entered; set true when AT+QICSGP is sent from
  * Modem_Process (after the RX buffer is drained) so we never mistake the
@@ -475,9 +479,13 @@ static void process_line(const char *line)
     }
 
     /* Modem restarted unexpectedly (brownout/reset): all runtime MQTT/SSL
-     * config is lost. Schedule a full Modem_Init() instead of partial retry. */
+     * config is lost. Schedule a full Modem_Init() instead of partial retry.
+     * Suppress during the 20s grace period after Modem_Init — late boot URCs
+     * (APP RDY, +CFUN: 1) from the AT+CFUN=1,1 OTA reboot path must not
+     * trigger a spurious re-init.                                            */
     if ((strstr(line, "RDY") || strstr(line, "+CFUN: 1")) &&
-        mqtt_state != MQTT_STATE_BOOT)
+        mqtt_state != MQTT_STATE_BOOT &&
+        (int32_t)(HAL_GetTick() - modem_init_grace_until) >= 0)
     {
         modem_reinit_pending = true;
         Debug_Print("[MODEM] Unsolicited modem reboot detected\r\n");
@@ -1177,7 +1185,12 @@ static void modem_ota_start(const char *url)
     /* Hint EC200 that MQTT context 0 no longer needs TLS memory before
      * starting HTTPS context 1 for OTA. */
     modem_cmd("AT+QMTCFG=\"ssl\",0,0");
-    HAL_Delay(OTA_POST_QMTCLOSE_DELAY_MS);
+    /* Pet IWDG every 500 ms — a single HAL_Delay(8000) would exceed the 4s
+     * watchdog timeout and cause a spurious STM32 reset before QHTTPGET. */
+    for (int _i = 0; _i < (int)(OTA_POST_QMTCLOSE_DELAY_MS / 500); _i++) {
+        HAL_Delay(500);
+        IWDG->KR = 0xAAAAU;
+    }
     HAL_IWDG_Refresh(&hiwdg);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
     mqtt_state = MQTT_STATE_DISCONNECTED;
@@ -1356,6 +1369,10 @@ void Modem_Init(UART_HandleTypeDef *huart)
         Debug_Print("[MODEM] OTA reboot — PDP deactivated, going to NET_WAIT\r\n");
     mqtt_state       = MQTT_STATE_NET_WAIT;
     state_entered_ms = HAL_GetTick();
+    /* Suppress modem_reinit for 20 s after init — late EC200U boot URCs
+     * (APP RDY, +CFUN: 1) that arrive during the config phase must not
+     * re-trigger a full Modem_Init unnecessarily.                       */
+    modem_init_grace_until = HAL_GetTick() + 20000UL;
     modem_cmd("AT+CEREG?");
 }
 
