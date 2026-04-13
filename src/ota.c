@@ -25,7 +25,7 @@ extern IWDG_HandleTypeDef hiwdg;
 
 /* ── Private config ─────────────────────────────────────────────────────── */
 #define OTA_CHUNK_SIZE   256U          /* bytes per AT+QFREAD request       */
-#define OTA_HTTP_FILE    "UFS:HTTP_GETFILE"
+#define OTA_HTTP_FILE    "HTTP_GETFILE"
 #define OTA_STATUS_TOPIC "pump/01/ota/status"
 #define OTA_PROGRESS_EVERY (4096U)     /* publish progress every 4 KB       */
 #define OTA_CMD_TIMEOUT_MS 120000UL  /* 120 s for HTTP GET; modem given 110 s (see OTA_StartFromGet) */
@@ -64,6 +64,7 @@ static uint32_t     ota_last_progress= 0;     /* offset at last progress publish
 static uint32_t     ota_state_ms     = 0;     /* time entered current state      */
 static uint32_t     ota_timeout_ms   = 0;
 static int          ota_file_handle  = -1;
+static bool         qfopen_sent      = false;  /* true after AT+QFOPEN is sent */
 
 /* Binary accumulation buffer (for AT+QFREAD raw response) */
 static uint8_t      ota_bin_buf[OTA_CHUNK_SIZE];
@@ -269,6 +270,7 @@ void OTA_StartFromGet(const char *url)
     ota_bin_expect    = 0;
     ota_bin_pos       = 0;
     ota_file_handle   = -1;
+    qfopen_sent       = false;
 
     /* Publish a "http_get" status so the error message saved in modem.c's
      * ota_error_msg shows we reached this stage.  This survives MQTT reconnect
@@ -410,12 +412,11 @@ void OTA_HandleLine(const char *line)
                          (unsigned long)ota_file_size);
                 ota_publish(msg);
             }
-            {
-                char cmd[72];
-                snprintf(cmd, sizeof(cmd), "AT+QHTTPREADFILE=\"%s\",80", OTA_HTTP_FILE);
-                ota_send(cmd);
-                ota_enter(OTA_ST_HTTP_READFILE, OTA_CMD_TIMEOUT_MS);
-            }
+            /* AT+QHTTPGET auto-saves the response body to "HTTP_GETFILE" on
+             * EC200U UFS — no AT+QHTTPREADFILE step needed.  Skip straight to
+             * FILE_OPEN; OTA_Process sends AT+QFOPEN after a 2 s UFS-settle. */
+            qfopen_sent = false;
+            ota_enter(OTA_ST_FILE_OPEN, 15000);
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPGET failed");
         break;
@@ -428,12 +429,12 @@ void OTA_HandleLine(const char *line)
                 ota_error("QHTTPREADFILE failed");
                 break;
             }
-            {
-                char cmd[64];
-                snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", OTA_HTTP_FILE);
-                ota_send(cmd);
-                ota_enter(OTA_ST_FILE_OPEN, 5000);
-            }
+            /* EC200U needs ~2 s to finalise UFS write before QFOPEN works.
+             * Sending QFOPEN immediately causes the modem to silently ignore
+             * the command (no response at all).  OTA_Process sends QFOPEN
+             * after the settle delay instead of doing it here.             */
+            qfopen_sent = false;
+            ota_enter(OTA_ST_FILE_OPEN, 15000);   /* 2s settle + response budget */
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPREADFILE failed");
         break;
@@ -515,6 +516,22 @@ void OTA_Process(void)
     }
 
     switch (ota_state) {
+
+    case OTA_ST_FILE_OPEN:
+        /* Send AT+QFOPEN after a 2 s settle — the EC200U's UFS write started
+         * by AT+QHTTPREADFILE may not be fully committed when the
+         * +QHTTPREADFILE: 0 URC arrives.  Waiting 2 s before sending QFOPEN
+         * ensures the file is accessible without polling or retry logic.   */
+        if (!qfopen_sent &&
+            (int32_t)(HAL_GetTick() - ota_state_ms) >= 2000)
+        {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", OTA_HTTP_FILE);
+            ota_send(cmd);
+            qfopen_sent = true;
+            Debug_Print("[OTA] AT+QFOPEN sent after 2s settle\r\n");
+        }
+        break;
 
     case OTA_ST_CHUNK_FLASH: {
         /* Flash the accumulated binary chunk to App Slot B */

@@ -1129,13 +1129,14 @@ static void modem_ota_start(const char *url)
     HAL_IWDG_Refresh(&hiwdg);
 
     /* Stop any lingering HTTP session and delete any leftover file from a
-     * previous failed OTA attempt.  AT+QHTTPREADFILE writes the GET response
-     * body to UFS:HTTP_GETFILE; delete it first so stale content cannot be
-     * flashed if the save step fails. Errors from both commands are ignored. */
+     * previous failed OTA attempt.  AT+QHTTPGET auto-saves the response to
+     * "HTTP_GETFILE" on EC200U UFS (no drive prefix).  Delete it first so
+     * stale content cannot be flashed if a previous download was incomplete.
+     * Errors from both commands are ignored. */
     modem_cmd("AT+QHTTPSTOP");
     HAL_Delay(500);
     HAL_IWDG_Refresh(&hiwdg);
-    modem_cmd("AT+QFDEL=\"UFS:HTTP_GETFILE\"");
+    modem_cmd("AT+QFDEL=\"HTTP_GETFILE\"");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
@@ -1205,13 +1206,14 @@ static void modem_ota_publish(const char *topic, const char *payload)
 {
     (void)topic;  /* topic always pump/01/ota/status — matches ota_error_msg path */
 
-    /* OTA error messages must survive MQTT disconnect+reconnect.
-     * The reconnect code clears pub_pending (drops unsent messages), so any
-     * OTA error published while MQTT is down would be permanently lost.
-     * Save all OTA publishes to ota_error_msg so they survive reconnect and
-     * are published by the CONNECTED check in Modem_Process.                */
-    strncpy(ota_error_msg, payload, sizeof(ota_error_msg) - 1);
-    ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
+    /* Only save meaningful OTA status updates to ota_error_msg so they
+     * survive MQTT disconnect+reconnect.  Skip ota_debug trace lines —
+     * they are published for every received AT line during download and
+     * would clobber the real error/success status before MQTT reconnects.*/
+    if (strstr(payload, "\"ota_status\"")) {
+        strncpy(ota_error_msg, payload, sizeof(ota_error_msg) - 1);
+        ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
+    }
 
     if (strstr(payload, "modem rebooted during ota")) {
         ota_retry_block_until = HAL_GetTick() + OTA_RETRY_BLOCK_MS;
@@ -1245,6 +1247,22 @@ void Modem_Init(UART_HandleTypeDef *huart)
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
     if (ota_reboot) {
+        /* Check OTA flags to determine if the bootloader applied the update.
+         * Bootloader erases the flags page (all bytes → 0xFF) after a
+         * successful App B → App A copy.  If the flags magic is still
+         * OTA_MAGIC the bootloader CRC check failed and old App A is kept.  */
+        volatile uint32_t *flags_magic = (volatile uint32_t*)OTA_FLAGS_ADDR;
+        if (*flags_magic == 0xFFFFFFFFUL) {
+            /* Erased flags = bootloader ran + copy succeeded → new firmware */
+            strncpy(ota_error_msg, "{\"ota_status\":\"success\"}",
+                    sizeof(ota_error_msg) - 1);
+            Debug_Print("[OTA] New firmware running — will publish success\r\n");
+        } else {
+            /* Flags still present = bootloader CRC check failed, old App A kept */
+            strncpy(ota_error_msg, "{\"ota_status\":\"error\",\"reason\":\"crc_fail\"}",
+                    sizeof(ota_error_msg) - 1);
+            Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
+        }
         /* AT+QHTTPSTOP does NOT fully free the TLS context-1 heap on the
          * EC200U after an HTTPS OTA download.  Without clearing it,
          * AT+QMTOPEN cannot allocate SSL buffers for MQTT context 0 and
