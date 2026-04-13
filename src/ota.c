@@ -160,6 +160,14 @@ static void ota_send_close_file(void)
     ota_send(cmd);
 }
 
+static const char *ota_qfopen_name_for_attempt(uint8_t attempt)
+{
+    /* Some EC200U firmware accepts only one of these forms. */
+    if (attempt <= 2U)
+        return OTA_HTTP_FILE;         /* "HTTP_GETFILE" */
+    return "UFS:HTTP_GETFILE";
+}
+
 /* ── Flash write helpers ─────────────────────────────────────────────────── */
 static bool flash_erase_page(uint32_t addr)
 {
@@ -549,22 +557,31 @@ void OTA_Process(void)
             uint32_t wait_ms = (qfopen_attempts == 0) ? OTA_QFOPEN_SETTLE_MS : OTA_QFOPEN_RETRY_MS;
             uint32_t base_ms = (qfopen_attempts == 0) ? ota_state_ms : qfopen_last_try_ms;
             if ((int32_t)(now - base_ms) >= (int32_t)wait_ms) {
-                char cmd[64];
-                snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", OTA_HTTP_FILE);
+                const char *qf_name = ota_qfopen_name_for_attempt((uint8_t)(qfopen_attempts + 1U));
+                char cmd[80];
+                snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", qf_name);
                 ota_send(cmd);
                 qfopen_sent = true;
                 qfopen_last_try_ms = now;
                 qfopen_attempts++;
                 char dbg[96];
                 snprintf(dbg, sizeof(dbg),
-                         "[OTA] AT+QFOPEN attempt %u/%u sent\r\n",
+                         "[OTA] AT+QFOPEN attempt %u/%u sent (%s)\r\n",
                          (unsigned)qfopen_attempts,
-                         (unsigned)OTA_QFOPEN_MAX_ATTEMPTS);
+                         (unsigned)OTA_QFOPEN_MAX_ATTEMPTS,
+                         qf_name);
                 Debug_Print(dbg);
             }
-        } else if (qfopen_attempts >= OTA_QFOPEN_MAX_ATTEMPTS &&
-                   (int32_t)(HAL_GetTick() - qfopen_last_try_ms) >= (int32_t)OTA_QFOPEN_RETRY_MS) {
-            ota_error("fopen TO");
+        } else {
+            /* If modem stays silent after a QFOPEN attempt, re-arm send flag
+             * after retry interval so the next loop sends another attempt. */
+            if ((int32_t)(HAL_GetTick() - qfopen_last_try_ms) >= (int32_t)OTA_QFOPEN_RETRY_MS) {
+                if (qfopen_attempts >= OTA_QFOPEN_MAX_ATTEMPTS) {
+                    ota_error("fopen TO");
+                } else {
+                    qfopen_sent = false;
+                }
+            }
         }
         break;
 
