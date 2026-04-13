@@ -1175,41 +1175,90 @@ static void modem_ota_start(const char *url)
     }
     HAL_IWDG_Refresh(&hiwdg);
 
-    /* ── PHASE 2: URL accepted — disconnect MQTT, then start download ───────
-     * Only AT+QHTTPGET requires MQTT disconnect (two simultaneous TLS sessions
-     * are not supported).  Disconnect as late as possible so any future error
-     * in ota.c can be published when MQTT auto-reconnects.                  */
+    /* ── PHASE 2: disconnect MQTT, full modem reset, restart download ───────
+     *
+     * Problem: AT+QFOPEN is silently ignored after a previous failed QFOPEN
+     * attempt.  The EC200U's UFS file system mutex gets stuck and the only
+     * command that clears it is AT+CFUN=1,1 (full modem software reset).
+     * QIDEACT+QIACT frees TLS RAM (fixes 729) but does NOT clear the FS
+     * mutex.  CFUN=1,1 fixes both.
+     *
+     * Since CFUN=1,1 wipes all modem config (SSL, HTTP, URL), we call
+     * OTA_Start() instead of OTA_StartFromGet() so the state machine
+     * re-applies SSL context and URL from scratch on the clean modem.      */
     modem_cmd("AT+QMTDISC=0");
     HAL_Delay(500);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QMTCLOSE=0");
-    HAL_Delay(500);
-    HAL_IWDG_Refresh(&hiwdg);
-    modem_cmd("AT+QMTCFG=\"ssl\",0,0");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
 
-    /* Deactivate PDP context to fully release the MQTT TLS heap.
-     * AT+QMTCLOSE frees the TCP socket but the TLS context 0 RAM buffers
-     * (cipher suite, handshake state) remain allocated until PDP teardown.
-     * Without this, AT+QHTTPREADFILE fails with error 729 (memory alloc
-     * failed) because the modem cannot allocate the UFS write buffer while
-     * TLS context 0 RAM is still fragmented.
-     * Then reactivate PDP so the HTTPS client can connect for QHTTPGET.  */
-    modem_cmd("AT+QIDEACT=1");
-    for (int _i = 0; _i < 14; _i++) {   /* up to 7 s for bearer to drop  */
+    Debug_Print("[OTA] CFUN=1,1 — full modem reset to clear UFS/TLS state\r\n");
+    modem_cmd("AT+CFUN=1,1");
+    modem_sync_expect("RDY", 30000);          /* wait up to 30 s for modem  */
+    IWDG->KR = 0xAAAAU;
+    for (int _i = 0; _i < 30; _i++) {        /* 15 s: SIM CPIN + network   */
         HAL_Delay(500); IWDG->KR = 0xAAAAU;
     }
-    modem_cmd("AT+QIACT=1");
-    for (int _i = 0; _i < 14; _i++) {   /* up to 7 s for PDP to come up  */
-        HAL_Delay(500); IWDG->KR = 0xAAAAU;
+    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 200) == HAL_OK) {} }
+    IWDG->KR = 0xAAAAU;
+
+    modem_sync_cmd_ok("ATE0", 2000, 5);       /* disable echo after reset   */
+
+    /* Reactivate PDP context — retry up to 3× in case network not ready   */
+    for (int _a = 0; _a < 3; _a++) {
+        modem_cmd("AT+QIACT=1");
+        if (modem_sync_expect("OK", 15000)) break;
+        for (int _i = 0; _i < 6; _i++) {     /* 3 s between retries        */
+            HAL_Delay(500); IWDG->KR = 0xAAAAU;
+        }
     }
     HAL_IWDG_Refresh(&hiwdg);
-    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+
+    /* Re-sync parser and configure HTTP/TLS synchronously after CFUN reset.
+     * This avoids async SSL state races right after reboot. */
+    if (!modem_sync_cmd_ok("AT", 2000, 8))
+        Debug_Print("[OTA] WARN: AT sync before OTA HTTP cfg failed\r\n");
+    modem_sync_cmd_ok("ATE0", 2000, 3);
+    HAL_Delay(300); IWDG->KR = 0xAAAAU;
+
+    modem_sync_cmd_ok("AT+QSSLCFG=\"sslversion\",1,4", 3000, 3);
+    modem_sync_cmd_ok("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", 3000, 3);
+    modem_sync_cmd_ok("AT+QSSLCFG=\"seclevel\",1,0", 3000, 3);
+    modem_sync_cmd_ok("AT+QHTTPCFG=\"sslctxid\",1", 3000, 3);
+    modem_sync_cmd_ok("AT+QHTTPCFG=\"ssl\",1", 3000, 3);
+    modem_sync_cmd_ok(OTA_HTTP_REDIRECT_ENABLED ? "AT+QHTTPCFG=\"redirect\",1"
+                                                : "AT+QHTTPCFG=\"redirect\",0",
+                     3000, 3);
+    modem_sync_cmd_ok("AT+QHTTPCFG=\"responseheader\",0", 3000, 3);
+    modem_sync_cmd_ok("AT+QHTTPCFG=\"requestheader\",0", 3000, 3);
+    modem_sync_cmd_ok("AT+QHTTPSTOP", 3000, 2);
+    modem_cmd("AT+QFDEL=\"HTTP_GETFILE\"");  /* may fail if file absent */
+    HAL_Delay(300); IWDG->KR = 0xAAAAU;
+    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+
+    /* Set URL synchronously, then jump OTA state machine to QHTTPGET. */
+    {
+        char urlcmd2[32];
+        snprintf(urlcmd2, sizeof(urlcmd2), "AT+QHTTPURL=%d,5", (int)strlen(url));
+        modem_cmd(urlcmd2);
+        if (!modem_sync_expect("CONNECT", 10000)) {
+            queue_publish("pump/01/ota/status",
+                          "{\"ota_status\":\"error\",\"reason\":\"no CONNECT (post-cfun)\"}");
+            return;
+        }
+        Modem_Send(url);
+        if (!modem_sync_expect("OK", 10000)) {
+            queue_publish("pump/01/ota/status",
+                          "{\"ota_status\":\"error\",\"reason\":\"URL reject (post-cfun)\"}");
+            return;
+        }
+    }
+
     mqtt_state = MQTT_STATE_DISCONNECTED;
     HAL_IWDG_Refresh(&hiwdg);
 
-    /* URL accepted — enter OTA state machine at the HTTP GET phase */
+    /* URL + HTTP config are already set above; start directly from GET. */
     OTA_StartFromGet(url);
 }
 

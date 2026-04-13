@@ -30,6 +30,10 @@ extern IWDG_HandleTypeDef hiwdg;
 #define OTA_PROGRESS_EVERY (4096U)     /* publish progress every 4 KB       */
 #define OTA_CMD_TIMEOUT_MS 120000UL  /* 120 s for HTTP GET; modem given 110 s (see OTA_StartFromGet) */
 #define OTA_READ_TIMEOUT_MS 10000UL   /* 10 s per chunk read               */
+#define OTA_SSL_STEP_TIMEOUT_MS 15000UL
+#define OTA_QFOPEN_SETTLE_MS 5000UL
+#define OTA_QFOPEN_RETRY_MS 3000UL
+#define OTA_QFOPEN_MAX_ATTEMPTS 4U
 
 /* ── State machine ──────────────────────────────────────────────────────── */
 typedef enum {
@@ -65,6 +69,8 @@ static uint32_t     ota_state_ms     = 0;     /* time entered current state     
 static uint32_t     ota_timeout_ms   = 0;
 static int          ota_file_handle  = -1;
 static bool         qfopen_sent      = false;  /* true after AT+QFOPEN is sent */
+static uint8_t      qfopen_attempts  = 0;
+static uint32_t     qfopen_last_try_ms = 0;
 
 /* Binary accumulation buffer (for AT+QFREAD raw response) */
 static uint8_t      ota_bin_buf[OTA_CHUNK_SIZE];
@@ -239,15 +245,17 @@ void OTA_Start(const char *url)
     ota_bin_expect   = 0;
     ota_bin_pos      = 0;
     ota_file_handle  = -1;
+    qfopen_sent      = false;
+    qfopen_attempts  = 0;
+    qfopen_last_try_ms = 0;
 
     ota_publish("{\"ota_status\":\"starting\"}");
-    ota_publish("{\"ota_test\":\"debug enabled\"}");  // Test to confirm code update
 
     /* Enable SSL if URL is HTTPS */
     if (strncmp(ota_url, "https://", 8) == 0) {
         Debug_Print("[OTA] Enabling HTTPS with insecure config\r\n");
         ota_send("AT+QHTTPCFG=\"ssl\",1");
-        ota_enter(OTA_ST_SSL_ENABLE, 5000);
+        ota_enter(OTA_ST_SSL_ENABLE, OTA_SSL_STEP_TIMEOUT_MS);
     } else {
         /* No SSL — go straight to URL */
         char cmd[32];
@@ -271,6 +279,8 @@ void OTA_StartFromGet(const char *url)
     ota_bin_pos       = 0;
     ota_file_handle   = -1;
     qfopen_sent       = false;
+    qfopen_attempts   = 0;
+    qfopen_last_try_ms = 0;
 
     /* Publish a "http_get" status so the error message saved in modem.c's
      * ota_error_msg shows we reached this stage.  This survives MQTT reconnect
@@ -313,7 +323,7 @@ void OTA_HandleLine(const char *line)
     case OTA_ST_SSL_ENABLE:
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QSSLCFG=\"seclevel\",1,1");  // seclevel=1 to require CA verification
-            ota_enter(OTA_ST_SSL_SECLEVEL, 5000);
+            ota_enter(OTA_ST_SSL_SECLEVEL, OTA_SSL_STEP_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"SSL enable OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL enable failed");
         break;
@@ -321,7 +331,7 @@ void OTA_HandleLine(const char *line)
     case OTA_ST_SSL_SECLEVEL:
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QSSLCFG=\"cacert\",1,\"cacert.pem\"");  // Reference uploaded CA cert
-            ota_enter(OTA_ST_SSL_CACERT, 5000);
+            ota_enter(OTA_ST_SSL_CACERT, OTA_SSL_STEP_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"SSL seclevel OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL seclevel failed");
         break;
@@ -329,7 +339,7 @@ void OTA_HandleLine(const char *line)
     case OTA_ST_SSL_CACERT:
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QSSLCFG=\"sslversion\",1,4");
-            ota_enter(OTA_ST_SSL_VERSION, 5000);
+            ota_enter(OTA_ST_SSL_VERSION, OTA_SSL_STEP_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"SSL cacert OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL cacert failed");
         break;
@@ -337,7 +347,7 @@ void OTA_HandleLine(const char *line)
     case OTA_ST_SSL_VERSION:
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF");
-            ota_enter(OTA_ST_SSL_CIPHER, 5000);
+            ota_enter(OTA_ST_SSL_CIPHER, OTA_SSL_STEP_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"SSL version OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL version failed");
         break;
@@ -345,7 +355,7 @@ void OTA_HandleLine(const char *line)
     case OTA_ST_SSL_CIPHER:
         if (strcmp(line, "OK") == 0) {
             ota_send("AT+QHTTPCFG=\"sslctxid\",1");
-            ota_enter(OTA_ST_SSL_CTXID, 5000);
+            ota_enter(OTA_ST_SSL_CTXID, OTA_SSL_STEP_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"SSL cipher OK\"}");
         } else if (strstr(line, "ERROR")) ota_error("SSL cipher failed");
         break;
@@ -440,7 +450,9 @@ void OTA_HandleLine(const char *line)
              * the QHTTPSTOP OK time to arrive and be ignored).          */
             ota_send("AT+QHTTPSTOP");
             qfopen_sent = false;
-            ota_enter(OTA_ST_FILE_OPEN, 15000);
+            qfopen_attempts = 0;
+            qfopen_last_try_ms = 0;
+            ota_enter(OTA_ST_FILE_OPEN, 45000);
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPREADFILE failed");
         break;
@@ -458,7 +470,13 @@ void OTA_HandleLine(const char *line)
             ota_enter(OTA_ST_CHUNK_READ, OTA_READ_TIMEOUT_MS);
             ota_publish("{\"ota_debug\":\"File opened\"}");
         }
-        if (strstr(line, "ERROR")) ota_error("QFOPEN failed");
+        if (strstr(line, "ERROR")) {
+            if (qfopen_attempts >= OTA_QFOPEN_MAX_ATTEMPTS) {
+                ota_error("QFOPEN failed");
+            } else {
+                qfopen_sent = false;
+            }
+        }
         break;
 
     case OTA_ST_CHUNK_READ:
@@ -524,18 +542,29 @@ void OTA_Process(void)
     switch (ota_state) {
 
     case OTA_ST_FILE_OPEN:
-        /* Send AT+QFOPEN after a 2 s settle — the EC200U's UFS write started
-         * by AT+QHTTPREADFILE may not be fully committed when the
-         * +QHTTPREADFILE: 0 URC arrives.  Waiting 2 s before sending QFOPEN
-         * ensures the file is accessible without polling or retry logic.   */
-        if (!qfopen_sent &&
-            (int32_t)(HAL_GetTick() - ota_state_ms) >= 2000)
-        {
-            char cmd[64];
-            snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", OTA_HTTP_FILE);
-            ota_send(cmd);
-            qfopen_sent = true;
-            Debug_Print("[OTA] AT+QFOPEN sent after 2s settle\r\n");
+        /* EC200U can delay UFS commit after QHTTPREADFILE.
+         * Retry QFOPEN a few times instead of failing on first timeout. */
+        if (!qfopen_sent) {
+            uint32_t now = HAL_GetTick();
+            uint32_t wait_ms = (qfopen_attempts == 0) ? OTA_QFOPEN_SETTLE_MS : OTA_QFOPEN_RETRY_MS;
+            uint32_t base_ms = (qfopen_attempts == 0) ? ota_state_ms : qfopen_last_try_ms;
+            if ((int32_t)(now - base_ms) >= (int32_t)wait_ms) {
+                char cmd[64];
+                snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", OTA_HTTP_FILE);
+                ota_send(cmd);
+                qfopen_sent = true;
+                qfopen_last_try_ms = now;
+                qfopen_attempts++;
+                char dbg[96];
+                snprintf(dbg, sizeof(dbg),
+                         "[OTA] AT+QFOPEN attempt %u/%u sent\r\n",
+                         (unsigned)qfopen_attempts,
+                         (unsigned)OTA_QFOPEN_MAX_ATTEMPTS);
+                Debug_Print(dbg);
+            }
+        } else if (qfopen_attempts >= OTA_QFOPEN_MAX_ATTEMPTS &&
+                   (int32_t)(HAL_GetTick() - qfopen_last_try_ms) >= (int32_t)OTA_QFOPEN_RETRY_MS) {
+            ota_error("fopen TO");
         }
         break;
 
