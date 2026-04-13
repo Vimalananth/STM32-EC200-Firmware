@@ -34,6 +34,8 @@ extern IWDG_HandleTypeDef hiwdg;
 #define OTA_QFOPEN_SETTLE_MS 5000UL
 #define OTA_QFOPEN_RETRY_MS 3000UL
 #define OTA_QFOPEN_MAX_ATTEMPTS 4U
+#define OTA_HTTPSTOP_RETRY_MS 3000UL
+#define OTA_HTTPSTOP_MAX_ATTEMPTS 3U
 
 /* ── State machine ──────────────────────────────────────────────────────── */
 typedef enum {
@@ -48,6 +50,7 @@ typedef enum {
     OTA_ST_HTTP_URL_BODY,   /* sent URL text, waiting for OK                 */
     OTA_ST_HTTP_GET,        /* sent AT+QHTTPGET, waiting for +QHTTPGET URC   */
     OTA_ST_HTTP_READFILE,   /* sent AT+QHTTPREADFILE, waiting completion     */
+    OTA_ST_HTTP_STOP,       /* sent AT+QHTTPSTOP, waiting OK/URC             */
     OTA_ST_FILE_OPEN,       /* sent AT+QFOPEN, waiting for +QFOPEN handle    */
     OTA_ST_CHUNK_READ,      /* sent AT+QFREAD, waiting for CONNECT N header  */
     OTA_ST_CHUNK_BINARY,    /* receiving N raw bytes via OTA_FeedByte()      */
@@ -71,6 +74,8 @@ static int          ota_file_handle  = -1;
 static bool         qfopen_sent      = false;  /* true after AT+QFOPEN is sent */
 static uint8_t      qfopen_attempts  = 0;
 static uint32_t     qfopen_last_try_ms = 0;
+static uint8_t      httpstop_attempts = 0;
+static uint32_t     httpstop_last_try_ms = 0;
 
 /* Binary accumulation buffer (for AT+QFREAD raw response) */
 static uint8_t      ota_bin_buf[OTA_CHUNK_SIZE];
@@ -256,6 +261,8 @@ void OTA_Start(const char *url)
     qfopen_sent      = false;
     qfopen_attempts  = 0;
     qfopen_last_try_ms = 0;
+    httpstop_attempts = 0;
+    httpstop_last_try_ms = 0;
 
     ota_publish("{\"ota_status\":\"starting\"}");
 
@@ -289,6 +296,8 @@ void OTA_StartFromGet(const char *url)
     qfopen_sent       = false;
     qfopen_attempts   = 0;
     qfopen_last_try_ms = 0;
+    httpstop_attempts = 0;
+    httpstop_last_try_ms = 0;
 
     /* Publish a "http_get" status so the error message saved in modem.c's
      * ota_error_msg shows we reached this stage.  This survives MQTT reconnect
@@ -457,12 +466,25 @@ void OTA_HandleLine(const char *line)
              * OTA_Process sends QFOPEN after a 2 s settle (which gives
              * the QHTTPSTOP OK time to arrive and be ignored).          */
             ota_send("AT+QHTTPSTOP");
+            httpstop_attempts = 1;
+            httpstop_last_try_ms = HAL_GetTick();
+            ota_enter(OTA_ST_HTTP_STOP, 20000);
+        }
+        if (strstr(line, "ERROR")) ota_error("QHTTPREADFILE failed");
+        break;
+
+    case OTA_ST_HTTP_STOP:
+        if (strcmp(line, "OK") == 0 || strstr(line, "+QHTTPSTOP:")) {
             qfopen_sent = false;
             qfopen_attempts = 0;
             qfopen_last_try_ms = 0;
             ota_enter(OTA_ST_FILE_OPEN, 45000);
         }
-        if (strstr(line, "ERROR")) ota_error("QHTTPREADFILE failed");
+        if (strstr(line, "ERROR")) {
+            if (httpstop_attempts >= OTA_HTTPSTOP_MAX_ATTEMPTS) {
+                ota_error("QHTTPSTOP failed");
+            }
+        }
         break;
 
     case OTA_ST_FILE_OPEN:
@@ -530,6 +552,7 @@ void OTA_Process(void)
                 case OTA_ST_HTTP_URL_BODY: why = "no URL OK";   break;
                 case OTA_ST_HTTP_GET:      why = "http get TO"; break;
                 case OTA_ST_HTTP_READFILE: why = "readfile TO"; break;
+                case OTA_ST_HTTP_STOP:     why = "httpstop TO"; break;
                 case OTA_ST_FILE_OPEN:     why = "fopen TO";    break;
                 case OTA_ST_CHUNK_READ:    why = "chunk TO";    break;
                 case OTA_ST_CHUNK_BINARY:  why = "binary TO";   break;
@@ -548,6 +571,22 @@ void OTA_Process(void)
     }
 
     switch (ota_state) {
+
+    case OTA_ST_HTTP_STOP:
+        if (httpstop_attempts < OTA_HTTPSTOP_MAX_ATTEMPTS &&
+            (int32_t)(HAL_GetTick() - httpstop_last_try_ms) >= (int32_t)OTA_HTTPSTOP_RETRY_MS)
+        {
+            ota_send("AT+QHTTPSTOP");
+            httpstop_attempts++;
+            httpstop_last_try_ms = HAL_GetTick();
+            char dbg[96];
+            snprintf(dbg, sizeof(dbg),
+                     "[OTA] AT+QHTTPSTOP retry %u/%u\r\n",
+                     (unsigned)httpstop_attempts,
+                     (unsigned)OTA_HTTPSTOP_MAX_ATTEMPTS);
+            Debug_Print(dbg);
+        }
+        break;
 
     case OTA_ST_FILE_OPEN:
         /* EC200U can delay UFS commit after QHTTPREADFILE.
