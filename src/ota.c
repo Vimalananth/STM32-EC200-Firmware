@@ -25,15 +25,15 @@ extern IWDG_HandleTypeDef hiwdg;
 
 /* ── Private config ─────────────────────────────────────────────────────── */
 #define OTA_CHUNK_SIZE   256U          /* bytes per AT+QFREAD request       */
-#define OTA_HTTP_FILE    "HTTP_GETFILE"
+#define OTA_HTTP_FILE    "UFS:HTTP_GETFILE"
 #define OTA_STATUS_TOPIC "pump/01/ota/status"
 #define OTA_PROGRESS_EVERY (4096U)     /* publish progress every 4 KB       */
 #define OTA_CMD_TIMEOUT_MS 120000UL  /* 120 s for HTTP GET; modem given 110 s (see OTA_StartFromGet) */
 #define OTA_READ_TIMEOUT_MS 10000UL   /* 10 s per chunk read               */
 #define OTA_SSL_STEP_TIMEOUT_MS 15000UL
-#define OTA_QFOPEN_SETTLE_MS 5000UL
-#define OTA_QFOPEN_RETRY_MS 3000UL
-#define OTA_QFOPEN_MAX_ATTEMPTS 4U
+#define OTA_QFOPEN_SETTLE_MS 30000UL
+#define OTA_QFOPEN_RETRY_MS 8000UL
+#define OTA_QFOPEN_MAX_ATTEMPTS 8U
 #define OTA_HTTPSTOP_RETRY_MS 3000UL
 #define OTA_HTTPSTOP_MAX_ATTEMPTS 3U
 
@@ -168,9 +168,9 @@ static void ota_send_close_file(void)
 static const char *ota_qfopen_name_for_attempt(uint8_t attempt)
 {
     /* Some EC200U firmware accepts only one of these forms. */
-    if (attempt <= 2U)
-        return OTA_HTTP_FILE;         /* "HTTP_GETFILE" */
-    return "UFS:HTTP_GETFILE";
+    if (attempt < OTA_QFOPEN_MAX_ATTEMPTS)
+        return OTA_HTTP_FILE;         /* "UFS:HTTP_GETFILE" */
+    return "HTTP_GETFILE";
 }
 
 /* ── Flash write helpers ─────────────────────────────────────────────────── */
@@ -478,7 +478,7 @@ void OTA_HandleLine(const char *line)
             qfopen_sent = false;
             qfopen_attempts = 0;
             qfopen_last_try_ms = 0;
-            ota_enter(OTA_ST_FILE_OPEN, 45000);
+            ota_enter(OTA_ST_FILE_OPEN, 120000);
         }
         if (strstr(line, "ERROR")) {
             if (httpstop_attempts >= OTA_HTTPSTOP_MAX_ATTEMPTS) {
@@ -546,6 +546,14 @@ void OTA_Process(void)
         ota_timeout_ms > 0)
     {
         if (HAL_GetTick() - ota_state_ms > ota_timeout_ms) {
+            if (ota_state == OTA_ST_HTTP_STOP) {
+                Debug_Print("[OTA] QHTTPSTOP no response, proceeding to file open\r\n");
+                qfopen_sent = false;
+                qfopen_attempts = 0;
+                qfopen_last_try_ms = 0;
+                ota_enter(OTA_ST_FILE_OPEN, 120000);
+                return;
+            }
             const char *why;
             switch (ota_state) {
                 case OTA_ST_HTTP_URL_CMD:  why = "no CONNECT";  break;
