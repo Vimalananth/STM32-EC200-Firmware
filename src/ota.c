@@ -433,12 +433,14 @@ void OTA_HandleLine(const char *line)
                 ota_error("QHTTPREADFILE failed");
                 break;
             }
-            /* EC200U needs ~2 s to finalise UFS write before QFOPEN works.
-             * Sending QFOPEN immediately causes the modem to silently ignore
-             * the command (no response at all).  OTA_Process sends QFOPEN
-             * after the settle delay instead of doing it here.             */
+            /* AT+QHTTPSTOP MUST be sent before AT+QFOPEN.
+             * The modem holds the HTTP session open after QHTTPREADFILE
+             * and silently ignores QFOPEN while that session is active.
+             * OTA_Process sends QFOPEN after a 2 s settle (which gives
+             * the QHTTPSTOP OK time to arrive and be ignored).          */
+            ota_send("AT+QHTTPSTOP");
             qfopen_sent = false;
-            ota_enter(OTA_ST_FILE_OPEN, 15000);   /* 2s settle + response budget */
+            ota_enter(OTA_ST_FILE_OPEN, 15000);
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPREADFILE failed");
         break;
