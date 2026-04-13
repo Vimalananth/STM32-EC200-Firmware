@@ -25,7 +25,8 @@ extern IWDG_HandleTypeDef hiwdg;
 
 /* ── Private config ─────────────────────────────────────────────────────── */
 #define OTA_CHUNK_SIZE   256U          /* bytes per AT+QFREAD request       */
-#define OTA_HTTP_FILE    "UFS:HTTP_GETFILE"
+#define OTA_HTTP_FILE    "HTTP_GETFILE"
+#define OTA_HTTP_FILE_UFS "UFS:HTTP_GETFILE"
 #define OTA_STATUS_TOPIC "pump/01/ota/status"
 #define OTA_PROGRESS_EVERY (4096U)     /* publish progress every 4 KB       */
 #define OTA_CMD_TIMEOUT_MS 120000UL  /* 120 s for HTTP GET; modem given 110 s (see OTA_StartFromGet) */
@@ -36,6 +37,8 @@ extern IWDG_HandleTypeDef hiwdg;
 #define OTA_QFOPEN_MAX_ATTEMPTS 8U
 #define OTA_HTTPSTOP_RETRY_MS 3000UL
 #define OTA_HTTPSTOP_MAX_ATTEMPTS 3U
+#define OTA_MODEM_SYNC_RETRY_MS 3000UL
+#define OTA_FILE_PROBE_TIMEOUT_MS 15000UL
 
 /* ── State machine ──────────────────────────────────────────────────────── */
 typedef enum {
@@ -51,6 +54,8 @@ typedef enum {
     OTA_ST_HTTP_GET,        /* sent AT+QHTTPGET, waiting for +QHTTPGET URC   */
     OTA_ST_HTTP_READFILE,   /* sent AT+QHTTPREADFILE, waiting completion     */
     OTA_ST_HTTP_STOP,       /* sent AT+QHTTPSTOP, waiting OK/URC             */
+    OTA_ST_MODEM_SYNC,      /* send AT until modem replies OK                */
+    OTA_ST_FILE_PROBE,      /* sent AT+QFLST, waiting for file list result   */
     OTA_ST_FILE_OPEN,       /* sent AT+QFOPEN, waiting for +QFOPEN handle    */
     OTA_ST_CHUNK_READ,      /* sent AT+QFREAD, waiting for CONNECT N header  */
     OTA_ST_CHUNK_BINARY,    /* receiving N raw bytes via OTA_FeedByte()      */
@@ -76,6 +81,9 @@ static uint8_t      qfopen_attempts  = 0;
 static uint32_t     qfopen_last_try_ms = 0;
 static uint8_t      httpstop_attempts = 0;
 static uint32_t     httpstop_last_try_ms = 0;
+static uint32_t     modem_sync_last_try_ms = 0;
+static bool         modem_sync_probe_sent = false;
+static bool         file_probe_seen = false;
 
 /* Binary accumulation buffer (for AT+QFREAD raw response) */
 static uint8_t      ota_bin_buf[OTA_CHUNK_SIZE];
@@ -167,10 +175,13 @@ static void ota_send_close_file(void)
 
 static const char *ota_qfopen_name_for_attempt(uint8_t attempt)
 {
-    /* Some EC200U firmware accepts only one of these forms. */
-    if (attempt < OTA_QFOPEN_MAX_ATTEMPTS)
-        return OTA_HTTP_FILE;         /* "UFS:HTTP_GETFILE" */
-    return "HTTP_GETFILE";
+    /* EC200U firmware variants differ in path parsing across QHTTPREADFILE/QFOPEN.
+     * Rotate known-good forms instead of trying only one until the final attempt. */
+    switch ((attempt - 1U) % 3U) {
+        case 0:  return OTA_HTTP_FILE;      /* HTTP_GETFILE */
+        case 1:  return OTA_HTTP_FILE_UFS;  /* UFS:HTTP_GETFILE */
+        default: return "UFS:/HTTP_GETFILE";
+    }
 }
 
 /* ── Flash write helpers ─────────────────────────────────────────────────── */
@@ -263,6 +274,9 @@ void OTA_Start(const char *url)
     qfopen_last_try_ms = 0;
     httpstop_attempts = 0;
     httpstop_last_try_ms = 0;
+    modem_sync_last_try_ms = 0;
+    modem_sync_probe_sent = false;
+    file_probe_seen = false;
 
     ota_publish("{\"ota_status\":\"starting\"}");
 
@@ -298,6 +312,9 @@ void OTA_StartFromGet(const char *url)
     qfopen_last_try_ms = 0;
     httpstop_attempts = 0;
     httpstop_last_try_ms = 0;
+    modem_sync_last_try_ms = 0;
+    modem_sync_probe_sent = false;
+    file_probe_seen = false;
 
     /* Publish a "http_get" status so the error message saved in modem.c's
      * ota_error_msg shows we reached this stage.  This survives MQTT reconnect
@@ -475,15 +492,45 @@ void OTA_HandleLine(const char *line)
 
     case OTA_ST_HTTP_STOP:
         if (strcmp(line, "OK") == 0 || strstr(line, "+QHTTPSTOP:")) {
-            qfopen_sent = false;
-            qfopen_attempts = 0;
-            qfopen_last_try_ms = 0;
-            ota_enter(OTA_ST_FILE_OPEN, 120000);
+            modem_sync_last_try_ms = 0;
+            modem_sync_probe_sent = false;
+            ota_enter(OTA_ST_MODEM_SYNC, 60000);
         }
         if (strstr(line, "ERROR")) {
             if (httpstop_attempts >= OTA_HTTPSTOP_MAX_ATTEMPTS) {
                 ota_error("QHTTPSTOP failed");
             }
+        }
+        break;
+
+    case OTA_ST_MODEM_SYNC:
+        if (strcmp(line, "OK") == 0) {
+            /* Accept only an OK that belongs to our AT probe, not a stale trailing OK
+             * from a previous command/URC sequence. */
+            if (!modem_sync_probe_sent ||
+                (int32_t)(HAL_GetTick() - modem_sync_last_try_ms) > (int32_t)(OTA_MODEM_SYNC_RETRY_MS - 500UL))
+            {
+                Debug_Print("[OTA] Ignoring stale OK during modem sync\r\n");
+                break;
+            }
+            file_probe_seen = false;
+            ota_send("AT+QFLST=\"HTTP_GETFILE\"");
+            ota_enter(OTA_ST_FILE_PROBE, OTA_FILE_PROBE_TIMEOUT_MS);
+        }
+        break;
+
+    case OTA_ST_FILE_PROBE:
+        if (strstr(line, "+QFLST:") && strstr(line, "HTTP_GETFILE")) {
+            file_probe_seen = true;
+        }
+        if (strcmp(line, "OK") == 0 || strstr(line, "ERROR")) {
+            if (!file_probe_seen) {
+                Debug_Print("[OTA] QFLST did not confirm file; trying QFOPEN anyway\r\n");
+            }
+            qfopen_sent = false;
+            qfopen_attempts = 0;
+            qfopen_last_try_ms = HAL_GetTick() - OTA_QFOPEN_SETTLE_MS; /* first attempt immediately */
+            ota_enter(OTA_ST_FILE_OPEN, 120000);
         }
         break;
 
@@ -547,11 +594,10 @@ void OTA_Process(void)
     {
         if (HAL_GetTick() - ota_state_ms > ota_timeout_ms) {
             if (ota_state == OTA_ST_HTTP_STOP) {
-                Debug_Print("[OTA] QHTTPSTOP no response, proceeding to file open\r\n");
-                qfopen_sent = false;
-                qfopen_attempts = 0;
-                qfopen_last_try_ms = 0;
-                ota_enter(OTA_ST_FILE_OPEN, 120000);
+                Debug_Print("[OTA] QHTTPSTOP no response, trying modem sync\r\n");
+                modem_sync_last_try_ms = 0;
+                modem_sync_probe_sent = false;
+                ota_enter(OTA_ST_MODEM_SYNC, 60000);
                 return;
             }
             const char *why;
@@ -561,6 +607,8 @@ void OTA_Process(void)
                 case OTA_ST_HTTP_GET:      why = "http get TO"; break;
                 case OTA_ST_HTTP_READFILE: why = "readfile TO"; break;
                 case OTA_ST_HTTP_STOP:     why = "httpstop TO"; break;
+                case OTA_ST_MODEM_SYNC:    why = "modem sync TO"; break;
+                case OTA_ST_FILE_PROBE:    why = "file probe TO"; break;
                 case OTA_ST_FILE_OPEN:     why = "fopen TO";    break;
                 case OTA_ST_CHUNK_READ:    why = "chunk TO";    break;
                 case OTA_ST_CHUNK_BINARY:  why = "binary TO";   break;
@@ -593,6 +641,27 @@ void OTA_Process(void)
                      (unsigned)httpstop_attempts,
                      (unsigned)OTA_HTTPSTOP_MAX_ATTEMPTS);
             Debug_Print(dbg);
+        }
+        break;
+
+    case OTA_ST_MODEM_SYNC:
+        if (modem_sync_last_try_ms == 0 ||
+            (int32_t)(HAL_GetTick() - modem_sync_last_try_ms) >= (int32_t)OTA_MODEM_SYNC_RETRY_MS)
+        {
+            ota_send("AT");
+            modem_sync_last_try_ms = HAL_GetTick();
+            modem_sync_probe_sent = true;
+            Debug_Print("[OTA] Modem sync probe: AT\r\n");
+        }
+        break;
+
+    case OTA_ST_FILE_PROBE:
+        if ((int32_t)(HAL_GetTick() - ota_state_ms) >= (int32_t)OTA_FILE_PROBE_TIMEOUT_MS) {
+            Debug_Print("[OTA] QFLST timeout; trying QFOPEN directly\r\n");
+            qfopen_sent = false;
+            qfopen_attempts = 0;
+            qfopen_last_try_ms = HAL_GetTick() - OTA_QFOPEN_SETTLE_MS; /* immediate */
+            ota_enter(OTA_ST_FILE_OPEN, 120000);
         }
         break;
 
