@@ -1183,14 +1183,26 @@ static void modem_ota_start(const char *url)
     HAL_Delay(500);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QMTCLOSE=0");
-    /* Hint EC200 that MQTT context 0 no longer needs TLS memory before
-     * starting HTTPS context 1 for OTA. */
+    HAL_Delay(500);
+    HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QMTCFG=\"ssl\",0,0");
-    /* Pet IWDG every 500 ms — a single HAL_Delay(8000) would exceed the 4s
-     * watchdog timeout and cause a spurious STM32 reset before QHTTPGET. */
-    for (int _i = 0; _i < (int)(OTA_POST_QMTCLOSE_DELAY_MS / 500); _i++) {
-        HAL_Delay(500);
-        IWDG->KR = 0xAAAAU;
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+
+    /* Deactivate PDP context to fully release the MQTT TLS heap.
+     * AT+QMTCLOSE frees the TCP socket but the TLS context 0 RAM buffers
+     * (cipher suite, handshake state) remain allocated until PDP teardown.
+     * Without this, AT+QHTTPREADFILE fails with error 729 (memory alloc
+     * failed) because the modem cannot allocate the UFS write buffer while
+     * TLS context 0 RAM is still fragmented.
+     * Then reactivate PDP so the HTTPS client can connect for QHTTPGET.  */
+    modem_cmd("AT+QIDEACT=1");
+    for (int _i = 0; _i < 14; _i++) {   /* up to 7 s for bearer to drop  */
+        HAL_Delay(500); IWDG->KR = 0xAAAAU;
+    }
+    modem_cmd("AT+QIACT=1");
+    for (int _i = 0; _i < 14; _i++) {   /* up to 7 s for PDP to come up  */
+        HAL_Delay(500); IWDG->KR = 0xAAAAU;
     }
     HAL_IWDG_Refresh(&hiwdg);
     { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
