@@ -412,11 +412,15 @@ void OTA_HandleLine(const char *line)
                          (unsigned long)ota_file_size);
                 ota_publish(msg);
             }
-            /* AT+QHTTPGET auto-saves the response body to "HTTP_GETFILE" on
-             * EC200U UFS — no AT+QHTTPREADFILE step needed.  Skip straight to
-             * FILE_OPEN; OTA_Process sends AT+QFOPEN after a 2 s UFS-settle. */
-            qfopen_sent = false;
-            ota_enter(OTA_ST_FILE_OPEN, 15000);
+            /* AT+QHTTPGET fills the modem's internal RAM buffer only.
+             * AT+QHTTPREADFILE transfers that buffer → UFS file "HTTP_GETFILE"
+             * so AT+QFOPEN can read it back in chunks.                        */
+            {
+                char cmd[64];
+                snprintf(cmd, sizeof(cmd), "AT+QHTTPREADFILE=\"%s\",80", OTA_HTTP_FILE);
+                ota_send(cmd);
+                ota_enter(OTA_ST_HTTP_READFILE, OTA_CMD_TIMEOUT_MS);
+            }
         }
         if (strstr(line, "ERROR")) ota_error("QHTTPGET failed");
         break;
