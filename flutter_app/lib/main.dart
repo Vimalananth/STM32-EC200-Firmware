@@ -51,34 +51,25 @@ class _PumpDashboardState extends State<PumpDashboard> {
   @override
   void initState() {
     super.initState();
-    for (final id in ['pump01', 'pump02']) {
-      db.ref('pumps/$id/status/relay1_state').onValue.listen((event) {
-        if (mounted) {
-          setState(() => _pumpOn[id] = (event.snapshot.value ?? 0) == 1);
-        }
-      });
-    }
+    // Both pumps are on the same device — relay1 = pump01, relay2 = pump02
+    db.ref('pumps/pump01/status/relay1_state').onValue.listen((event) {
+      if (mounted) setState(() => _pumpOn['pump01'] = (event.snapshot.value ?? 0) == 1);
+    });
+    db.ref('pumps/pump01/status/relay2_state').onValue.listen((event) {
+      if (mounted) setState(() => _pumpOn['pump02'] = (event.snapshot.value ?? 0) == 1);
+    });
   }
 
   // Called by PumpCard when user presses the pump button.
-  // Enforces mutual exclusion: turns off the other pump first.
+  // Both pumps are on the same device: relay1 = pump01, relay2 = pump02.
+  // Always writes to pumps/pump01/cmd so bridge forwards to pump/01/cmd.
   Future<void> _handlePumpToggle(String pumpId, bool turnOn) async {
-    if (turnOn) {
-      for (final other in _pumpOn.keys) {
-        if (other != pumpId && (_pumpOn[other] ?? false)) {
-          await db.ref('pumps/$other/cmd').set({
-            'relay1': 0,
-            'relay2': 0,
-            'ts': DateTime.now().millisecondsSinceEpoch,
-          });
-        }
-      }
-    }
-    await db.ref('pumps/$pumpId/cmd').set({
-      'relay1': turnOn ? 1 : 0,
-      'relay2': 0,
-      'ts': DateTime.now().millisecondsSinceEpoch,
-    });
+    // Only send the field for the pump being toggled.
+    // Sending both fields would pulse the wrong coil on the latching relay.
+    final Map<String, dynamic> cmd = {'ts': DateTime.now().millisecondsSinceEpoch};
+    if (pumpId == 'pump01') cmd['relay1'] = turnOn ? 1 : 0;
+    if (pumpId == 'pump02') cmd['relay2'] = turnOn ? 1 : 0;
+    await db.ref('pumps/pump01/cmd').set(cmd);
   }
 
   @override
@@ -97,12 +88,16 @@ class _PumpDashboardState extends State<PumpDashboard> {
             PumpCard(
               pumpId: 'pump01',
               pumpName: 'Pump 1',
+              otherPumpOn: _pumpOn['pump02'] ?? false,
+              otherPumpName: 'Pump 2',
               onPumpToggle: (val) => _handlePumpToggle('pump01', val),
             ),
             const SizedBox(height: 16),
             PumpCard(
               pumpId: 'pump02',
               pumpName: 'Pump 2',
+              otherPumpOn: _pumpOn['pump01'] ?? false,
+              otherPumpName: 'Pump 1',
               onPumpToggle: (val) => _handlePumpToggle('pump02', val),
             ),
             const SizedBox(height: 16),
@@ -294,12 +289,16 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
 class PumpCard extends StatefulWidget {
   final String pumpId;
   final String pumpName;
+  final bool otherPumpOn;
+  final String otherPumpName;
   final Future<void> Function(bool) onPumpToggle;
 
   const PumpCard({
     super.key,
     required this.pumpId,
     required this.pumpName,
+    required this.otherPumpOn,
+    required this.otherPumpName,
     required this.onPumpToggle,
   });
 
@@ -310,7 +309,6 @@ class PumpCard extends StatefulWidget {
 class _PumpCardState extends State<PumpCard> {
   final db = FirebaseDatabase.instance;
 
-  Map<String, dynamic> _status = {};
   Map<String, dynamic> _alerts = {};
   bool _relay1Cmd = false;
 
@@ -329,12 +327,16 @@ class _PumpCardState extends State<PumpCard> {
   }
 
   void _listenStatus() {
-    db.ref('pumps/${widget.pumpId}/status').onValue.listen((event) {
+    // Both pumps are on the same device — all status comes from pumps/pump01/status.
+    // pump01 uses relay1_state; pump02 uses relay2_state.
+    db.ref('pumps/pump01/status').onValue.listen((event) {
       final data = event.snapshot.value;
       if (data != null && mounted) {
+        final s = Map<String, dynamic>.from(data as Map);
         setState(() {
-          _status    = Map<String, dynamic>.from(data as Map);
-          _relay1Cmd = (_status['relay1_state'] ?? 0) == 1;
+          _relay1Cmd = widget.pumpId == 'pump02'
+              ? (s['relay2_state'] ?? 0) == 1
+              : (s['relay1_state'] ?? 0) == 1;
         });
       }
     });
@@ -526,12 +528,26 @@ class _PumpCardState extends State<PumpCard> {
               child: _RelayButton(
                 label: 'Pump',
                 isOn: _relay1Cmd,
+                disabled: widget.otherPumpOn && !_relay1Cmd,
                 onToggle: (val) {
                   setState(() => _relay1Cmd = val);
                   widget.onPumpToggle(val);
                 },
               ),
             ),
+            if (widget.otherPumpOn && !_relay1Cmd) ...[
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  const Icon(Icons.info_outline, size: 14, color: Colors.orange),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Turn off ${widget.otherPumpName} first',
+                    style: const TextStyle(fontSize: 12, color: Colors.orange),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 12),
 
             // ── Schedule section ──────────────────────────────────────────────
@@ -790,20 +806,23 @@ class _AlertChip extends StatelessWidget {
 class _RelayButton extends StatelessWidget {
   final String label;
   final bool isOn;
+  final bool disabled;
   final ValueChanged<bool> onToggle;
   const _RelayButton(
-      {required this.label, required this.isOn, required this.onToggle});
+      {required this.label, required this.isOn, this.disabled = false, required this.onToggle});
 
   @override
   Widget build(BuildContext context) {
     return ElevatedButton(
       style: ElevatedButton.styleFrom(
-        backgroundColor: isOn ? Colors.green : Colors.grey.shade300,
-        foregroundColor: isOn ? Colors.white : Colors.black87,
+        backgroundColor: disabled
+            ? Colors.grey.shade200
+            : isOn ? Colors.green : Colors.grey.shade300,
+        foregroundColor: disabled ? Colors.grey : isOn ? Colors.white : Colors.black87,
         padding: const EdgeInsets.symmetric(vertical: 14),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
-      onPressed: () => onToggle(!isOn),
+      onPressed: disabled ? null : () => onToggle(!isOn),
       child: Text('$label\n${isOn ? "ON" : "OFF"}',
           textAlign: TextAlign.center,
           style: const TextStyle(fontWeight: FontWeight.bold)),

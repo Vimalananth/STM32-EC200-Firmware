@@ -9,7 +9,7 @@
  * Request:  FC04, slave 0x01, start 0x0000, count 22 (0x16)
  *           Reads V1N, V2N, V3N, AvgVLN, V12, V23, V31, AvgVLL, I1, I2, I3
  * Response: 49 bytes — 3 header + 44 data + 2 CRC
- *           V1N  @ buf+3,   V2N  @ buf+7,   V3N  @ buf+11
+ *           V12  @ buf+19,  V23  @ buf+23,  V31  @ buf+27  (L-L voltages)
  *           I1   @ buf+35,  I2   @ buf+39,  I3   @ buf+43
  *
  * Note: Selec EM4M limits FC04 to max 32 registers per request.
@@ -203,11 +203,11 @@ void Modbus_Process(void)
                 mb_data_ok = true;
                 /* Response layout — each float = 2 registers = 4 bytes
                  * Offset = 3 + (modbus_addr * 2)
-                 * V1N(0x0000)→buf+3   V2N(0x0002)→buf+7   V3N(0x0004)→buf+11
+                 * V12(0x0008)→buf+19  V23(0x000A)→buf+23  V31(0x000C)→buf+27  (L-L)
                  * I1 (0x0010)→buf+35  I2 (0x0012)→buf+39  I3 (0x0014)→buf+43 */
-                v1 = parse_float_be(rx_buf + 3);
-                v2 = parse_float_be(rx_buf + 7);
-                v3 = parse_float_be(rx_buf + 11);
+                v1 = parse_float_be(rx_buf + 19);  /* V12 L1-L2 */
+                v2 = parse_float_be(rx_buf + 23);  /* V23 L2-L3 */
+                v3 = parse_float_be(rx_buf + 27);  /* V31 L3-L1 */
                 i1 = parse_float_be(rx_buf + 35);
                 i2 = parse_float_be(rx_buf + 39);
                 i3 = parse_float_be(rx_buf + 43);

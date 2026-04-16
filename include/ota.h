@@ -57,6 +57,9 @@ void OTA_StartFromGet(const char *url);
  * machine.  modem.c should call this (and return early) for ALL lines while
  * OTA_IsActive() is true so OTA URCs are not misinterpreted as MQTT ones.  */
 void OTA_HandleLine(const char *line);
+bool OTA_ExpectingHttpReadConnect(void);
+void OTA_ForceHttpReadStream(void);
+bool OTA_ShouldYieldRx(void);
 
 /* Returns true while an OTA download/flash sequence is in progress.
  * modem.c uses this to:

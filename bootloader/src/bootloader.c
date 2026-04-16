@@ -43,6 +43,11 @@ typedef struct {
     uint32_t reserved;
 } OTA_Flags_t;
 
+static inline void boot_wdg_kick(void)
+{
+    IWDG->KR = 0xAAAAU;
+}
+
 /* ── CRC32 (IEEE 802.3 / PKZIP) — matches ota.c implementation ── */
 static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
@@ -59,30 +64,41 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 static bool flash_erase_pages(uint32_t first_page, uint32_t num_pages)
 {
     FLASH_EraseInitTypeDef e = {
-        .TypeErase   = FLASH_TYPEERASE_PAGES,
-        .Page        = first_page,
-        .NbPages     = num_pages,
+        .TypeErase = FLASH_TYPEERASE_PAGES,
+        .NbPages = 1,
     };
-    uint32_t page_err = 0;
+    uint32_t page_err = 0xFFFFFFFFUL;
     HAL_FLASH_Unlock();
-    bool ok = (HAL_FLASHEx_Erase(&e, &page_err) == HAL_OK);
+    for (uint32_t i = 0; i < num_pages; i++) {
+        e.Page = first_page + i;
+        boot_wdg_kick();
+        if (HAL_FLASHEx_Erase(&e, &page_err) != HAL_OK) {
+            HAL_FLASH_Lock();
+            return false;
+        }
+        boot_wdg_kick();
+    }
     HAL_FLASH_Lock();
-    return ok;
+    return true;
 }
 
 /* ── Copy Slot B → Slot A in 8-byte (double-word) chunks ── */
-static bool flash_copy_slot(void)
+static bool flash_copy_slot(uint32_t size)
 {
     const uint8_t *src = (const uint8_t *)APP_SLOT_B_ADDR;
     uint32_t       dst = APP_SLOT_A_ADDR;
+    uint32_t       copy_len = (size + 7U) & ~7U;
 
     HAL_FLASH_Unlock();
-    for (uint32_t i = 0; i + 8 <= OTA_SLOT_SIZE; i += 8) {
+    for (uint32_t i = 0; i + 8 <= copy_len; i += 8) {
         uint64_t dw;
         memcpy(&dw, src + i, 8);
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, dst + i, dw) != HAL_OK) {
             HAL_FLASH_Lock();
             return false;
+        }
+        if ((i & 0x1FFU) == 0U) {
+            boot_wdg_kick();
         }
     }
     HAL_FLASH_Lock();
@@ -134,14 +150,23 @@ int main(void)
         flags->size  > 0         &&
         flags->size  <= OTA_SLOT_SIZE)
     {
-        /* Compute CRC32 of Slot B */
-        uint32_t crc = crc32_update(0, (const uint8_t *)APP_SLOT_B_ADDR, flags->size);
+        /* Compute CRC32 of Slot B with periodic watchdog kicks. */
+        uint32_t crc = 0;
+        uint32_t done = 0;
+        const uint8_t *src = (const uint8_t *)APP_SLOT_B_ADDR;
+        while (done < flags->size) {
+            uint32_t step = flags->size - done;
+            if (step > 512U) step = 512U;
+            crc = crc32_update(crc, src + done, step);
+            done += step;
+            boot_wdg_kick();
+        }
 
         if (crc == flags->crc32)
         {
             /* CRC OK — copy Slot B to Slot A */
             if (flash_erase_pages(APP_SLOT_A_PAGE, APP_SLOT_A_PAGES))
-                flash_copy_slot();
+                flash_copy_slot(flags->size);
         }
         /* Whether copy succeeded or CRC failed, erase the flags so we
          * don't loop trying to re-apply a bad update on every boot.    */

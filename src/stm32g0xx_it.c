@@ -125,6 +125,9 @@ void PendSV_Handler(void)
 void SysTick_Handler(void)
 {
   /* USER CODE BEGIN SysTick_IRQn 0 */
+  /* Keep watchdog alive even during long blocking sections in modem/OTA code.
+   * If the core hangs hard with interrupts disabled, IWDG still expires. */
+  IWDG->KR = 0xAAAAU;
 
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();

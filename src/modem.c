@@ -165,6 +165,39 @@ static bool ota_retry_blocked(void)
     return ((int32_t)(HAL_GetTick() - ota_retry_block_until) < 0);
 }
 
+static void modem_log_reset_flags(uint32_t csr)
+{
+    char flags[128];
+    flags[0] = '\0';
+#ifdef RCC_CSR_LPWRRSTF
+    if (csr & RCC_CSR_LPWRRSTF) strcat(flags, " LPWR");
+#endif
+#ifdef RCC_CSR_WWDGRSTF
+    if (csr & RCC_CSR_WWDGRSTF) strcat(flags, " WWDG");
+#endif
+#ifdef RCC_CSR_IWDGRSTF
+    if (csr & RCC_CSR_IWDGRSTF) strcat(flags, " IWDG");
+#endif
+#ifdef RCC_CSR_SFTRSTF
+    if (csr & RCC_CSR_SFTRSTF) strcat(flags, " SFTRST");
+#endif
+#ifdef RCC_CSR_PORRSTF
+    if (csr & RCC_CSR_PORRSTF) strcat(flags, " POR");
+#endif
+#ifdef RCC_CSR_PINRSTF
+    if (csr & RCC_CSR_PINRSTF) strcat(flags, " PIN");
+#endif
+#ifdef RCC_CSR_BORRSTF
+    if (csr & RCC_CSR_BORRSTF) strcat(flags, " BOR");
+#endif
+    if (flags[0] == '\0') strcpy(flags, " <none>");
+    {
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg), "[MODEM] Reset flags:%s\r\n", flags);
+        Debug_Print(dbg);
+    }
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Low-level UART helpers
@@ -462,6 +495,7 @@ static bool extract_ota_url_any(const char *text, char *out, size_t max)
 
 static void modem_ota_start(const char *url); /* forward declaration */
 static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
+static bool modem_is_exact_reboot_urc(const char *line);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Line processor — called for every complete line received from EC200U
@@ -483,7 +517,8 @@ static void process_line(const char *line)
      * Suppress during the 20s grace period after Modem_Init — late boot URCs
      * (APP RDY, +CFUN: 1) from the AT+CFUN=1,1 OTA reboot path must not
      * trigger a spurious re-init.                                            */
-    if ((strstr(line, "RDY") || strstr(line, "+CFUN: 1")) &&
+    if (!OTA_IsActive() &&
+        modem_is_exact_reboot_urc(line) &&
         mqtt_state != MQTT_STATE_BOOT &&
         (int32_t)(HAL_GetTick() - modem_init_grace_until) >= 0)
     {
@@ -724,6 +759,8 @@ static void process_line(const char *line)
         if (strstr(line, "OK") && qiact_sent)
         {
             Debug_Print("[NET] PDP active — opening broker\r\n");
+            modem_cmd("AT+QIDNSCFG=1,\"8.8.8.8\",\"8.8.4.4\"");
+            HAL_Delay(200);
             qiact_retry_done = false;
             mqtt_state = MQTT_STATE_BROKER_OPEN;
             state_entered_ms = HAL_GetTick();
@@ -1032,14 +1069,49 @@ static bool modem_sync_cmd_ok(const char *cmd, uint32_t timeout_ms, uint8_t retr
     return false;
 }
 
+static bool modem_is_exact_reboot_urc(const char *line)
+{
+    if (!line || !line[0]) return false;
+    if (strcmp(line, "RDY") == 0) return true;
+    if (strcmp(line, "+CFUN: 1") == 0) return true;
+    return false;
+}
+
+static bool modem_extract_host(const char *url, char *host, size_t host_sz)
+{
+    const char *p = strstr(url, "://");
+    const char *start = p ? (p + 3) : url;
+    size_t i = 0;
+    if (!host || host_sz < 2 || !start || *start == '\0')
+        return false;
+    while (start[i] &&
+           start[i] != '/' &&
+           start[i] != ':' &&
+           start[i] != '?' &&
+           start[i] != '#' &&
+           i < (host_sz - 1U))
+    {
+        host[i] = start[i];
+        i++;
+    }
+    host[i] = '\0';
+    return i > 0;
+}
+
 /* ── OTA trigger helper — re-applies HTTP config before each download ────── */
 static void modem_ota_start(const char *url)
 {
+    char ota_host[96] = {0};
+    bool have_ota_host = modem_extract_host(url, ota_host, sizeof(ota_host));
     /* Central cooldown guard: block OTA retrigger after modem reboot during OTA. */
     if (ota_retry_blocked()) {
         Debug_Print("[OTA] Trigger ignored (cooldown active)\r\n");
         queue_publish("pump/01/ota/status",
                       "{\"ota_status\":\"error\",\"reason\":\"ota cooldown active\"}");
+        return;
+    }
+    if (ota_error_msg[0] != '\0') {
+        Debug_Print("[OTA] Trigger ignored while OTA result publish is pending\r\n");
         return;
     }
 
@@ -1107,6 +1179,23 @@ static void modem_ota_start(const char *url)
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QSSLCFG=\"seclevel\",1,0");
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+    /* EC200U HTTPS servers behind CDN (e.g., GitHub raw) typically require
+     * TLS SNI and can reject handshake when modem RTC is stale. */
+    if (have_ota_host) {
+        char sni_cmd[160];
+        snprintf(sni_cmd, sizeof(sni_cmd), "AT+QSSLCFG=\"sni\",1,\"%s\"", ota_host);
+        modem_cmd(sni_cmd);
+    } else {
+        modem_cmd("AT+QSSLCFG=\"sni\",1,1");
+    }
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+    modem_cmd("AT+QSSLCFG=\"ignorelocaltime\",1,1");
+    HAL_Delay(300);
+    HAL_IWDG_Refresh(&hiwdg);
+    modem_cmd("AT+QHTTPCFG=\"contextid\",1");
     HAL_Delay(300);
     HAL_IWDG_Refresh(&hiwdg);
     modem_cmd("AT+QHTTPCFG=\"sslctxid\",1");
@@ -1213,6 +1302,7 @@ static void modem_ota_start(const char *url)
             HAL_Delay(500); IWDG->KR = 0xAAAAU;
         }
     }
+    modem_sync_cmd_ok("AT+QIDNSCFG=1,\"8.8.8.8\",\"8.8.4.4\"", 3000, 2);
     HAL_IWDG_Refresh(&hiwdg);
 
     /* Re-sync parser and configure HTTP/TLS synchronously after CFUN reset.
@@ -1225,6 +1315,15 @@ static void modem_ota_start(const char *url)
     modem_sync_cmd_ok("AT+QSSLCFG=\"sslversion\",1,4", 3000, 3);
     modem_sync_cmd_ok("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", 3000, 3);
     modem_sync_cmd_ok("AT+QSSLCFG=\"seclevel\",1,0", 3000, 3);
+    if (have_ota_host) {
+        char sni_cmd2[160];
+        snprintf(sni_cmd2, sizeof(sni_cmd2), "AT+QSSLCFG=\"sni\",1,\"%s\"", ota_host);
+        modem_sync_cmd_ok(sni_cmd2, 3000, 3);
+    } else {
+        modem_sync_cmd_ok("AT+QSSLCFG=\"sni\",1,1", 3000, 3);
+    }
+    modem_sync_cmd_ok("AT+QSSLCFG=\"ignorelocaltime\",1,1", 3000, 3);
+    modem_sync_cmd_ok("AT+QHTTPCFG=\"contextid\",1", 3000, 3);
     modem_sync_cmd_ok("AT+QHTTPCFG=\"sslctxid\",1", 3000, 3);
     modem_sync_cmd_ok("AT+QHTTPCFG=\"ssl\",1", 3000, 3);
     modem_sync_cmd_ok(OTA_HTTP_REDIRECT_ENABLED ? "AT+QHTTPCFG=\"redirect\",1"
@@ -1304,7 +1403,14 @@ void Modem_Init(UART_HandleTypeDef *huart)
     /* Detect software reset (NVIC_SystemReset after OTA) vs cold power-on.
      * RCC_CSR_SFTRSTF is set by NVIC_SystemReset; PORRSTF is set on power-on.
      * Used below to choose the initial MQTT state. */
-    bool ota_reboot = (RCC->CSR & RCC_CSR_SFTRSTF) != 0;
+    uint32_t reset_csr = RCC->CSR;
+    bool ota_reboot = (reset_csr & RCC_CSR_SFTRSTF) != 0;
+    {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "[MODEM] Reset CSR: 0x%08lX\r\n", (unsigned long)reset_csr);
+        Debug_Print(dbg);
+    }
+    modem_log_reset_flags(reset_csr);
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
     if (ota_reboot) {
@@ -1317,11 +1423,13 @@ void Modem_Init(UART_HandleTypeDef *huart)
             /* Erased flags = bootloader ran + copy succeeded → new firmware */
             strncpy(ota_error_msg, "{\"ota_status\":\"success\"}",
                     sizeof(ota_error_msg) - 1);
+            ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] New firmware running — will publish success\r\n");
         } else {
             /* Flags still present = bootloader CRC check failed, old App A kept */
             strncpy(ota_error_msg, "{\"ota_status\":\"error\",\"reason\":\"crc_fail\"}",
                     sizeof(ota_error_msg) - 1);
+            ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
         }
         /* AT+QHTTPSTOP does NOT fully free the TLS context-1 heap on the
@@ -1464,12 +1572,17 @@ void Modem_Process(void)
     if (!modem_uart)
         return;
 
+    /* Keep feeding watchdog even when no UART data arrives. */
+    HAL_IWDG_Refresh(&hiwdg);
+
     /* ── read bytes from EC200U into line buffer ── */
     /* Direct hardware register read — same approach as Modbus RX.
      * Bypasses HAL lock/unlock overhead (~6 µs per call) so the main loop
      * runs at <1 µs/iteration, fast enough to read USART2 Modbus bytes
      * (one every 1040 µs at 9600 baud) without overrun.                  */
     uint8_t c;
+    static uint8_t ota_connect_match = 0;
+    static uint16_t ota_rx_pet = 0;
     for (;;) {
         uint32_t isr1 = modem_uart->Instance->ISR;
         if (isr1 & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE)) {
@@ -1478,10 +1591,33 @@ void Modem_Process(void)
         }
         if (!(isr1 & USART_ISR_RXNE_RXFNE)) break;
         c = (uint8_t)(modem_uart->Instance->RDR & 0xFF);
+        if (++ota_rx_pet >= 64U) { HAL_IWDG_Refresh(&hiwdg); ota_rx_pet = 0; }
 
-        /* OTA binary passthrough — raw bytes from AT+QFREAD, before line logic */
+        /* Detect prompt-style CONNECT from AT+QHTTPREAD that may arrive without
+         * a clean line break. */
+        if (OTA_ExpectingHttpReadConnect()) {
+            static const char token[] = "CONNECT";
+            if (c == (uint8_t)token[ota_connect_match]) {
+                ota_connect_match++;
+                if (ota_connect_match >= (sizeof(token) - 1U)) {
+                    ota_connect_match = 0;
+                    OTA_HandleLine("CONNECT");
+                }
+                continue;
+            }
+            ota_connect_match = (c == (uint8_t)token[0]) ? 1U : 0U;
+            /* While waiting for CONNECT, keep bytes isolated from line parser. */
+            continue;
+        } else {
+            ota_connect_match = 0;
+        }
+
+        /* OTA binary passthrough — raw bytes from AT+QFREAD/QHTTPREAD */
         if (OTA_BinaryPending()) {
             OTA_FeedByte(c);
+            if (OTA_ShouldYieldRx()) {
+                break;
+            }
             continue;
         }
 
@@ -1525,7 +1661,7 @@ void Modem_Process(void)
 
     /* Full modem reset recovery path: re-run Modem_Init so SSL/MQTT config
      * is restored before attempting any reconnect. */
-    if (modem_reinit_pending) {
+    if (modem_reinit_pending && !OTA_IsActive()) {
         modem_reinit_pending = false;
         recv_payload_pending = false;
         pub_pending = false;
@@ -1581,7 +1717,7 @@ void Modem_Process(void)
     }
 
     /* ── periodic tasks (only when fully connected) ── */
-    if (mqtt_state == MQTT_STATE_CONNECTED)
+    if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())
     {
 
         /* publish on state change — relay or dry-run trip changed */
@@ -1613,11 +1749,15 @@ void Modem_Process(void)
     }
 
     /* ── send OTA error (saved across reconnect) as soon as MQTT is up ── */
-    if (ota_error_msg[0] && mqtt_state == MQTT_STATE_CONNECTED && !pub_pending)
+    if (ota_error_msg[0] && mqtt_state == MQTT_STATE_CONNECTED)
     {
+        pub_pending = false; /* prioritize OTA result over queued heartbeat */
         queue_publish("pump/01/ota/status", ota_error_msg);
         ota_error_msg[0] = '\0';
     }
+
+    /* Feed once more after draining RX loop. */
+    HAL_IWDG_Refresh(&hiwdg);
 
     /* ── send queued publish when connected and idle (not during OTA) ── */
     if (pub_pending && mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())

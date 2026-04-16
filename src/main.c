@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#define FW_VER "2026-04-16-stream-4"
 
 /* USER CODE END Includes */
 
@@ -109,20 +110,12 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();  /* Modbus RS485 at 9600 baud */
   MX_USART1_UART_Init();  /* EC200U modem at 115200 baud */
-  /* Blink relay 3x at boot — confirms firmware is running.
-   * Latching relay: pulse SET coil ON, then RESET coil OFF for each blink. */
-  for (int i = 0; i < 3; i++) {
-    /* SET pulse — relay latches ON */
-    HAL_GPIO_WritePin(Relay_Pin_GPIO_Port, Relay_Pin_Pin, GPIO_PIN_SET);
-    HAL_Delay(50);
-    HAL_GPIO_WritePin(Relay_Pin_GPIO_Port, Relay_Pin_Pin, GPIO_PIN_RESET);
-    HAL_Delay(200);
-    /* RESET pulse — relay latches OFF */
-    HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_SET);
-    HAL_Delay(50);
-    HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_RESET);
-    HAL_Delay(200);
-  }
+  Debug_Print("[FW] Version: " FW_VER "\r\n");
+  /* Boot state: all coil pins LOW — no pulse, latching relays hold last position */
+  HAL_GPIO_WritePin(Relay_Pin_GPIO_Port,  Relay_Pin_Pin,  GPIO_PIN_RESET); /* PA1 LOW — pump1 SET   coil idle */
+  HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_RESET); /* PB3 LOW — pump1 RESET coil idle */
+  HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_RESET); /* PB4 LOW — pump2 SET   coil idle */
+  HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET); /* PB5 LOW — pump2 RESET coil idle */
 
   /* Initialize ADC1 for voltage/current sensing (step 4 — real ADC).
    * Only compiled when HAL_ADC_MODULE_ENABLED is uncommented in hal_conf.h. */
@@ -131,13 +124,14 @@ int main(void)
 #endif
 
   /* Initialize Modbus RS485 master (USART2, PA8=DE/RE) */
-  Modbus_Init(&huart2);
+  // Modbus_Init(&huart2); // Temporarily disabled for debug on USART2
 
   /* Initialize modem attached to USART1 (PB6=TX, PB7=RX) */
   Modem_Init(&huart1);
 
   /* Start watchdog AFTER modem init (init takes ~10s, exceeds watchdog window) */
   MX_IWDG_Init();
+  Debug_Print("[WDT] Enabled (permanent fix)\r\n");
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -227,15 +221,15 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_2) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_2) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  if (HAL_UARTEx_EnableFifoMode(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -262,7 +256,7 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  // huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT; // Removed to fix compilation
   if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
@@ -283,8 +277,9 @@ static void MX_GPIO_Init(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /* Pump 1 SET coil (PA5) — latching relay, default coil de-energised */
+  /* PA1 — pump1 SET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay_Pin_GPIO_Port, Relay_Pin_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay_Pin_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -292,17 +287,17 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(Relay_Pin_GPIO_Port, &GPIO_InitStruct);
 
-  /* Pump 1 RESET coil (PA4) */
+  /* PB3 — pump1 RESET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay1_RST_Pin;
   HAL_GPIO_Init(Relay1_RST_GPIO_Port, &GPIO_InitStruct);
 
-  /* Pump 2 SET coil (PA1) */
+  /* PB4 — pump2 SET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_Pin_Pin;
   HAL_GPIO_Init(Relay2_Pin_GPIO_Port, &GPIO_InitStruct);
 
-  /* Pump 2 RESET coil (PA0) */
+  /* PB5 — pump2 RESET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_RST_Pin;
   HAL_GPIO_Init(Relay2_RST_GPIO_Port, &GPIO_InitStruct);
@@ -319,16 +314,17 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  Debug_Print — disabled: USART2 is now the Modbus RS485 port.
-  *         Transmitting here would block ~100 ms at 9600 baud and corrupt
-  *         the modem receive loop on USART1.
+  * @brief  Debug_Print — temporarily enabled for OTA diagnosis.
+  *         Transmitting on USART2 at 9600 baud.
   */
-void Debug_Print(const char *msg) { (void)msg; }
+void Debug_Print(const char *msg) {
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+}
 
 /* USER CODE END 4 */
 
 /**
-  * @brief  IWDG Initialization — ~4s timeout using LSI (~32kHz).
+  * @brief  IWDG Initialization — ~32s timeout using LSI (~32kHz).
   *         Started AFTER Modem_Init so the 10s boot sequence doesn't trigger it.
   *         If the main loop stops feeding the watchdog (firmware crash/hang),
   *         the STM32 resets automatically.
@@ -336,11 +332,12 @@ void Debug_Print(const char *msg) { (void)msg; }
 static void MX_IWDG_Init(void)
 {
   /* Timeout = (Reload + 1) * Prescaler / LSI_freq
-   * = (499 + 1) * 256 / 32000 = 4.0 s */
+   * = (4095 + 1) * 256 / 32000 ≈ 32.8 s
+   * OTA + bootloader copy path can exceed 4 s, so keep a wider watchdog window. */
   hiwdg.Instance       = IWDG;
   hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
   hiwdg.Init.Window    = IWDG_WINDOW_DISABLE;
-  hiwdg.Init.Reload    = 499;
+  hiwdg.Init.Reload    = 4095;
   if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
   {
     Error_Handler();
