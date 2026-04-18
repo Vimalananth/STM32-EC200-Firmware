@@ -51,7 +51,11 @@ extern "C" {
 
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
+#if defined(FW_MIN_LOGS)
+#define Debug_Print(...) ((void)0)
+#else
 void Debug_Print(const char *msg);  /* send string to USART2 serial monitor */
+#endif
 
 /* USER CODE BEGIN EFP */
 

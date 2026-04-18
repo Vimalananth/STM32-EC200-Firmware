@@ -22,10 +22,15 @@
 #include "modbus.h"
 #include "ota.h"
 #include <string.h>
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-04-16-stream-4"
+#define FW_VER "2026-04-18-stream-36-buf16k"
+extern volatile uint32_t g_reset_reason_magic;
+extern volatile uint32_t g_hf_pc;
+extern volatile uint32_t g_hf_lr;
+extern volatile uint32_t g_hf_psr;
 
 /* USER CODE END Includes */
 
@@ -111,6 +116,19 @@ int main(void)
   MX_USART2_UART_Init();  /* Modbus RS485 at 9600 baud */
   MX_USART1_UART_Init();  /* EC200U modem at 115200 baud */
   Debug_Print("[FW] Version: " FW_VER "\r\n");
+  if (g_reset_reason_magic == 0xDEAD0001UL) {
+    char fdbg[160];
+    snprintf(fdbg, sizeof(fdbg),
+             "[FAULT] Previous reset reason: HardFault pc=0x%08lX lr=0x%08lX xpsr=0x%08lX\r\n",
+             (unsigned long)g_hf_pc,
+             (unsigned long)g_hf_lr,
+             (unsigned long)g_hf_psr);
+    Debug_Print(fdbg);
+    g_reset_reason_magic = 0;
+    g_hf_pc = 0;
+    g_hf_lr = 0;
+    g_hf_psr = 0;
+  }
   /* Boot state: all coil pins LOW — no pulse, latching relays hold last position */
   HAL_GPIO_WritePin(Relay_Pin_GPIO_Port,  Relay_Pin_Pin,  GPIO_PIN_RESET); /* PA1 LOW — pump1 SET   coil idle */
   HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_RESET); /* PB3 LOW — pump1 RESET coil idle */
@@ -129,9 +147,9 @@ int main(void)
   /* Initialize modem attached to USART1 (PB6=TX, PB7=RX) */
   Modem_Init(&huart1);
 
-  /* Start watchdog AFTER modem init (init takes ~10s, exceeds watchdog window) */
+  /* Enable IWDG so all refresh points in modem/ota are valid and consistent. */
   MX_IWDG_Init();
-  Debug_Print("[WDT] Enabled (permanent fix)\r\n");
+  Debug_Print("[WDT] Enabled (32s timeout)\r\n");
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -317,9 +335,11 @@ static void MX_GPIO_Init(void)
   * @brief  Debug_Print — temporarily enabled for OTA diagnosis.
   *         Transmitting on USART2 at 9600 baud.
   */
+#if !defined(FW_MIN_LOGS)
 void Debug_Print(const char *msg) {
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
 }
+#endif
 
 /* USER CODE END 4 */
 
