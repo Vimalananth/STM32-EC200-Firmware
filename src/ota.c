@@ -267,51 +267,28 @@ static bool ota_is_exact_reboot_urc(const char *line)
 /* Stream Buffer */
 static void ota_stream_buf_reset(void)
 {
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
     ota_stream_buf_head = 0U;
     ota_stream_buf_tail = 0U;
     ota_stream_buf_count = 0U;
-    if ((primask & 1U) == 0U) {
-        __enable_irq();
-    }
 }
 
 static bool ota_stream_buf_push(uint8_t b)
 {
-    uint32_t primask = __get_PRIMASK();
-    bool ok = false;
-    __disable_irq();
-    if (ota_stream_buf_count < OTA_STREAM_BUF_SIZE) {
-        ota_stream_buf[ota_stream_buf_head] = b;
-        ota_stream_buf_head = (ota_stream_buf_head + 1U) % OTA_STREAM_BUF_SIZE;
-        ota_stream_buf_count++;
-        ok = true;
-    }
-    if ((primask & 1U) == 0U) {
-        __enable_irq();
-    }
-    return ok;
+    if (ota_stream_buf_count >= OTA_STREAM_BUF_SIZE)
+        return false;
+    ota_stream_buf[ota_stream_buf_head] = b;
+    ota_stream_buf_head = (ota_stream_buf_head + 1U) & (OTA_STREAM_BUF_SIZE - 1U);
+    ota_stream_buf_count++;
+    return true;
 }
 
 static uint32_t ota_stream_buf_pop_chunk(uint8_t *dst, uint32_t max_len)
 {
     uint32_t n = 0;
-    while (n < max_len) {
-        uint32_t primask = __get_PRIMASK();
-        __disable_irq();
-        if (ota_stream_buf_count == 0U) {
-            if ((primask & 1U) == 0U) {
-                __enable_irq();
-            }
-            break;
-        }
+    while (n < max_len && ota_stream_buf_count > 0U) {
         dst[n++] = ota_stream_buf[ota_stream_buf_tail];
-        ota_stream_buf_tail = (ota_stream_buf_tail + 1U) % OTA_STREAM_BUF_SIZE;
+        ota_stream_buf_tail = (ota_stream_buf_tail + 1U) & (OTA_STREAM_BUF_SIZE - 1U);
         ota_stream_buf_count--;
-        if ((primask & 1U) == 0U) {
-            __enable_irq();
-        }
     }
     return n;
 }
