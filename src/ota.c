@@ -143,9 +143,6 @@ static void ota_enter(OTA_State s, uint32_t timeout_ms)
     ota_state = s;
     ota_state_ms = HAL_GetTick();
     ota_timeout_ms = timeout_ms;
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "[OTA] Enter state %d, timeout %lu ms\r\n", (int)s, (unsigned long)timeout_ms);
-    Debug_Print(dbg);
 }
 
 static void ota_error(const char *reason)
@@ -547,7 +544,6 @@ static bool ota_preerase_slot_for_size(uint32_t image_size)
     uint32_t first_page;
     uint32_t pages;
     uint32_t page_idx;
-    char dbg[96];
 
     if (image_size == 0U || image_size > OTA_SLOT_SIZE) {
         return false;
@@ -566,19 +562,11 @@ static bool ota_preerase_slot_for_size(uint32_t image_size)
     for (page_idx = 0; page_idx < pages; page_idx++) {
         uint32_t addr = FLASH_BASE + ((first_page + page_idx) * OTA_PAGE_SIZE);
         HAL_IWDG_Refresh(&hiwdg);
-        snprintf(dbg, sizeof(dbg), "[OTA] Erasing page %lu at 0x%08lX\r\n",
-                 (unsigned long)(first_page + page_idx), (unsigned long)addr);
-        Debug_Print(dbg);
         if (!flash_erase_page(addr)) {
             ota_flash_lock_ll();
-            snprintf(dbg, sizeof(dbg),
-                     "[OTA] Pre-erase failed (hal=0x%08lX,page=0x%08lX)\r\n",
-                     (unsigned long)ota_last_flash_hal_err,
-                     (unsigned long)ota_last_flash_page_err);
-            Debug_Print(dbg);
+            Debug_Print("[OTA] Pre-erase failed\r\n");
             return false;
         }
-        Debug_Print("[OTA] Page erase succeeded\r\n");
         HAL_IWDG_Refresh(&hiwdg);
     }
 
@@ -721,13 +709,7 @@ void OTA_StartFromGet(const char *url)
 /* Handle Line */
 void OTA_HandleLine(const char *line)
 {
-    if (strstr(line, "+QHTTPGET") || strstr(line, "+QHTTPREAD") ||
-        strstr(line, "CONNECT") || strstr(line, "ERROR") || strstr(line, "+CME"))
-    {
-        char dbg[128];
-        snprintf(dbg, sizeof(dbg), "[OTA] Received: %s\r\n", line);
-        Debug_Print(dbg);
-    }
+    (void)line;
 
     if (ota_is_exact_reboot_urc(line)) {
         ota_error("modem rebooted during ota");
