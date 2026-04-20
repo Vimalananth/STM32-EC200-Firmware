@@ -26,7 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-04-18-stream-36-buf16k"
+#define FW_VER "2026-04-20-stream-48-clean"
 extern volatile uint32_t g_reset_reason_magic;
 extern volatile uint32_t g_hf_pc;
 extern volatile uint32_t g_hf_lr;
@@ -159,7 +159,11 @@ int main(void)
   while (1)
   {
     Modem_Process();
-    Modbus_Process();
+    /* Modbus TX blocks ~8ms at 9600 baud; pause it during OTA stream so
+       EC200U UART bytes are not dropped near end-of-download. */
+    if (!OTA_IsActive()) {
+      Modbus_Process();
+    }
     OTA_Process();
     HAL_IWDG_Refresh(&hiwdg);  /* feed watchdog — must happen within 4s */
     /* USER CODE END WHILE */

@@ -120,6 +120,7 @@ static bool pub_pending = false;
 
 /* OTA error saved here so it survives MQTT reconnect (heartbeat would overwrite pub_pending) */
 static char ota_error_msg[80];
+static bool force_status_after_ota = false;
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
@@ -302,6 +303,7 @@ static void queue_publish(const char *topic, const char *payload)
 {
     if (pub_pending)
         return; /* drop if previous not sent yet      */
+
     strncpy(pub_topic, topic, sizeof(pub_topic) - 1);
     strncpy(pub_payload, payload, sizeof(pub_payload) - 1);
     pub_topic[sizeof(pub_topic) - 1] = '\0';
@@ -688,8 +690,15 @@ static void process_line(const char *line)
     /* +CSQ: <rssi>,<ber>  — signal quality response */
     if (strstr(line, "+CSQ:"))
     {
-        int rssi = 99, ber = 0;
-        sscanf(line, "+CSQ: %d,%d", &rssi, &ber);
+        int rssi = 99;
+        const char *p = strchr(line, ':');
+        if (p)
+        {
+            p++;
+            while (*p == ' ')
+                p++;
+            rssi = atoi(p);
+        }
         if (rssi < 0 || rssi > 31) rssi = 99; /* sanitize */
         last_rssi = (int8_t)rssi;
         return;
@@ -728,8 +737,11 @@ static void process_line(const char *line)
         /* retry registration every 5s */
         if (HAL_GetTick() - state_entered_ms > 5000)
         {
+            Debug_Print("[NET] Waiting for registration...\r\n");
             state_entered_ms = HAL_GetTick();
             modem_cmd("AT+CGREG?");
+            HAL_Delay(80);
+            modem_cmd("AT+CEREG?");
         }
         break;
 
@@ -1582,6 +1594,7 @@ void Modem_Process(void)
      * (one every 1040 µs at 9600 baud) without overrun.                  */
     uint8_t c;
     static uint8_t ota_connect_match = 0;
+    static bool ota_skip_to_lf = false;
     static uint16_t ota_rx_pet = 0;
     for (;;) {
         uint32_t isr1 = modem_uart->Instance->ISR;
@@ -1601,6 +1614,7 @@ void Modem_Process(void)
                 ota_connect_match++;
                 if (ota_connect_match >= (sizeof(token) - 1U)) {
                     ota_connect_match = 0;
+                    ota_skip_to_lf = true;
                     OTA_HandleLine("CONNECT");
                 }
                 continue;
@@ -1612,12 +1626,17 @@ void Modem_Process(void)
             ota_connect_match = 0;
         }
 
+        /* Drop trailing CONNECT line ending before passing binary bytes to OTA. */
+        if (ota_skip_to_lf) {
+            if (c == '\n') {
+                ota_skip_to_lf = false;
+            }
+            continue;
+        }
+
         /* OTA binary passthrough — raw bytes from AT+QFREAD/QHTTPREAD */
         if (OTA_BinaryPending()) {
             OTA_FeedByte(c);
-            if (OTA_ShouldYieldRx()) {
-                break;
-            }
             continue;
         }
 
@@ -1625,11 +1644,11 @@ void Modem_Process(void)
             continue;
 
         /* '>' is the publish prompt — not followed by '\n', catch it here */
-        if (c == '>')
+                if (c == '>')
         {
             if (mqtt_state == MQTT_STATE_PUBLISHING && pub_pending)
             {
-                /* Send payload immediately — any blocking delay here risks
+                /* Send payload immediately � any blocking delay here risks
                  * the modem aborting the input window.                     */
                 HAL_UART_Transmit(modem_uart,
                                   (uint8_t *)pub_payload, strlen(pub_payload), 3000);
@@ -1685,6 +1704,15 @@ void Modem_Process(void)
         snprintf(apn_cmd, sizeof(apn_cmd),
                  "AT+QICSGP=1,1,\"%s\",\"\",\"\",0", SIM_APN);
         modem_cmd(apn_cmd);
+    }
+
+    /* ── BOOT heartbeat: keep probing modem until first RDY/OK is seen ── */
+    if (mqtt_state == MQTT_STATE_BOOT &&
+        (HAL_GetTick() - state_entered_ms) > 3000U)
+    {
+        Debug_Print("[MODEM] BOOT probe: AT\r\n");
+        modem_cmd("AT");
+        state_entered_ms = HAL_GetTick();
     }
 
     /* ── BROKER_OPEN / CONNECTING / SUBSCRIBING timeouts → reconnect ── */
@@ -1754,6 +1782,17 @@ void Modem_Process(void)
         pub_pending = false; /* prioritize OTA result over queued heartbeat */
         queue_publish("pump/01/ota/status", ota_error_msg);
         ota_error_msg[0] = '\0';
+        force_status_after_ota = true;
+    }
+
+    if (force_status_after_ota &&
+        mqtt_state == MQTT_STATE_CONNECTED &&
+        !OTA_IsActive() &&
+        !pub_pending)
+    {
+        modem_cmd("AT+CSQ");
+        publish_status();
+        force_status_after_ota = false;
     }
 
     /* Feed once more after draining RX loop. */
@@ -1865,3 +1904,5 @@ void Modem_Process(void)
         modem_cmd("AT+CEREG?");
     }
 }
+
+
