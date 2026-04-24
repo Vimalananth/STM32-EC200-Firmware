@@ -127,6 +127,21 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
+  /* .noinit at FIXED address 0x20007000 — NOT zero-initialised on reset,
+   * survives NVIC_SystemReset and the bootloader (which only zeros its own
+   * small .bss near 0x20000000).  Fixed address is CRITICAL: the OTA reboot
+   * sentinel must be at the same address in every firmware version so old
+   * firmware can write it and new firmware can read it after OTA swap.
+   * 0x20007000 = 28 KB into RAM, safely above .bss (~6 KB) and 8 KB below
+   * the stack top (0x20009000), leaving plenty of margin.                 */
+  .noinit 0x20007000 (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.noinit))
+    KEEP(*(.noinit*))
+    . = ALIGN(4);
+  } >RAM
+
   ._user_heap_stack :
   {
     . = ALIGN(8);
