@@ -21,16 +21,24 @@
 #include "modem.h"
 #include "modbus.h"
 #include "ota.h"
+#include "lora.h"
 #include <string.h>
 #include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-04-20-stream-48-clean"
+#define FW_VER "2026-04-24-ota-stable"
+const char g_fw_ver[] = FW_VER;
 extern volatile uint32_t g_reset_reason_magic;
 extern volatile uint32_t g_hf_pc;
 extern volatile uint32_t g_hf_lr;
 extern volatile uint32_t g_hf_psr;
+
+/* Compatibility shim for snapshots where fault markers are not linked */
+volatile uint32_t g_reset_reason_magic __attribute__((weak));
+volatile uint32_t g_hf_pc __attribute__((weak));
+volatile uint32_t g_hf_lr __attribute__((weak));
+volatile uint32_t g_hf_psr __attribute__((weak));
 
 /* USER CODE END Includes */
 
@@ -46,12 +54,14 @@ extern volatile uint32_t g_hf_psr;
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define WDG_KICK() do { IWDG->KR = 0xAAAAU; } while (0)
 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;  /* EC200U modem (PB6=TX, PB7=RX)              */
 UART_HandleTypeDef huart2;  /* Modbus RS485 (PA2=TX/DI, PA3=RX/RO, 9600) */
+UART_HandleTypeDef huart3;  /* Reyax RYL998 LoRa (PB8=TX, PB9=RX, 115200)*/
 IWDG_HandleTypeDef hiwdg;   /* Independent watchdog (~4s timeout) */
 /* ADC1 handle — used by sensors_adc.c when real ADC sensing is enabled.
  * Requires HAL_ADC_MODULE_ENABLED in hal_conf.h.                           */
@@ -60,6 +70,9 @@ ADC_HandleTypeDef hadc1;
 #endif
 
 /* USER CODE BEGIN PV */
+volatile uint8_t g_boot_phase = 0;
+static uint32_t g_hb_last_ms = 0;
+static GPIO_PinState g_hb_state = GPIO_PIN_RESET;
 
 /* USER CODE END PV */
 
@@ -68,6 +81,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
 static void MX_IWDG_Init(void);
 #ifdef HAL_ADC_MODULE_ENABLED
 static void MX_ADC1_Init(void);
@@ -93,12 +107,16 @@ int main(void)
   SCB->VTOR = 0x08002000;
   /* Bootloader disabled IRQs before jumping here; re-enable so SysTick works */
   __enable_irq();
+  g_boot_phase = 1;
+  WDG_KICK();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+  g_boot_phase = 2;
+  WDG_KICK();
 
   /* USER CODE BEGIN Init */
 
@@ -106,6 +124,8 @@ int main(void)
 
   /* Configure the system clock */
   SystemClock_Config();
+  g_boot_phase = 3;
+  WDG_KICK();
 
   /* USER CODE BEGIN SysInit */
 
@@ -113,22 +133,23 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USART2_UART_Init();  /* Modbus RS485 at 9600 baud */
+  g_boot_phase = 4;
+  WDG_KICK();
+
+  MX_USART2_UART_Init();  /* Modbus RS485 at 9600 baud — needed for Debug_Print */
+  g_boot_phase = 5;
+  WDG_KICK();
+
   MX_USART1_UART_Init();  /* EC200U modem at 115200 baud */
+  g_boot_phase = 6;
+  WDG_KICK();
+
+  MX_USART3_UART_Init();  /* Reyax RYL998 LoRa at 115200 baud */
+  LoRa_Init(&huart3);     /* send AT config commands (blocking, before IWDG) */
+  g_boot_phase = 7;
+  WDG_KICK();
+
   Debug_Print("[FW] Version: " FW_VER "\r\n");
-  if (g_reset_reason_magic == 0xDEAD0001UL) {
-    char fdbg[160];
-    snprintf(fdbg, sizeof(fdbg),
-             "[FAULT] Previous reset reason: HardFault pc=0x%08lX lr=0x%08lX xpsr=0x%08lX\r\n",
-             (unsigned long)g_hf_pc,
-             (unsigned long)g_hf_lr,
-             (unsigned long)g_hf_psr);
-    Debug_Print(fdbg);
-    g_reset_reason_magic = 0;
-    g_hf_pc = 0;
-    g_hf_lr = 0;
-    g_hf_psr = 0;
-  }
   /* Boot state: all coil pins LOW — no pulse, latching relays hold last position */
   HAL_GPIO_WritePin(Relay_Pin_GPIO_Port,  Relay_Pin_Pin,  GPIO_PIN_RESET); /* PA1 LOW — pump1 SET   coil idle */
   HAL_GPIO_WritePin(Relay1_RST_GPIO_Port, Relay1_RST_Pin, GPIO_PIN_RESET); /* PB3 LOW — pump1 RESET coil idle */
@@ -140,16 +161,20 @@ int main(void)
 #ifdef HAL_ADC_MODULE_ENABLED
   MX_ADC1_Init();
 #endif
+  g_boot_phase = 8;
 
   /* Initialize Modbus RS485 master (USART2, PA8=DE/RE) */
   // Modbus_Init(&huart2); // Temporarily disabled for debug on USART2
 
   /* Initialize modem attached to USART1 (PB6=TX, PB7=RX) */
   Modem_Init(&huart1);
+  g_boot_phase = 9;
+  WDG_KICK();
 
   /* Enable IWDG so all refresh points in modem/ota are valid and consistent. */
   MX_IWDG_Init();
   Debug_Print("[WDT] Enabled (32s timeout)\r\n");
+  g_boot_phase = 10;
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -158,13 +183,22 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    g_boot_phase = 11;
     Modem_Process();
-    /* Modbus TX blocks ~8ms at 9600 baud; pause it during OTA stream so
-       EC200U UART bytes are not dropped near end-of-download. */
-    if (!OTA_IsActive()) {
+    LoRa_Process();
+    /* Temporary PA8 blink validation mode:
+       keep RS485 driver control untouched by Modbus code so heartbeat owns PA8. */
+    /* if (!OTA_IsActive()) {
       Modbus_Process();
-    }
+    } */
     OTA_Process();
+    /* Diagnostic heartbeat: toggle PA8 (DE485) every 500ms to confirm MCU alive. */
+    if ((HAL_GetTick() - g_hb_last_ms) >= 500U) {
+      g_hb_last_ms = HAL_GetTick();
+      g_hb_state = (g_hb_state == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+      HAL_GPIO_WritePin(DE485_Pin_GPIO_Port, DE485_Pin_Pin, g_hb_state);
+    }
+    g_boot_phase = 12;
     HAL_IWDG_Refresh(&hiwdg);  /* feed watchdog — must happen within 4s */
     /* USER CODE END WHILE */
 
@@ -290,6 +324,33 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * @brief USART3 Initialization Function — Reyax RYL998 LoRa (PB8=TX, PB9=RX, 115200 baud)
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -341,7 +402,18 @@ static void MX_GPIO_Init(void)
   */
 #if !defined(FW_MIN_LOGS)
 void Debug_Print(const char *msg) {
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+  const uint8_t *p = (const uint8_t *)msg;
+  while (*p) {
+    uint32_t guard = 200000U;
+    while (((USART2->ISR & USART_ISR_TXE_TXFNF) == 0U) && guard--) {
+      WDG_KICK();
+    }
+    if (guard == 0U) {
+      return;
+    }
+    USART2->TDR = *p++;
+    WDG_KICK();
+  }
 }
 #endif
 

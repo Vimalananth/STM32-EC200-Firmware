@@ -138,6 +138,23 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     GPIO_InitStruct.Alternate = GPIO_AF1_USART2;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   }
+  else if(huart->Instance==USART3)
+  {
+    /* USART3 clock enable — Reyax RYL998 LoRa module */
+    __HAL_RCC_USART3_CLK_ENABLE();
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    /**USART3 GPIO Configuration
+    PB8     ------> USART3_TX  (AF4)
+    PB9     ------> USART3_RX  (AF4)
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF4_USART3;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  }
 
 }
 
@@ -171,6 +188,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
   {
     __HAL_RCC_USART2_CLK_DISABLE();
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_2|GPIO_PIN_3);
+  }
+  else if(huart->Instance==USART3)
+  {
+    __HAL_RCC_USART3_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8|GPIO_PIN_9);
   }
 
 }
