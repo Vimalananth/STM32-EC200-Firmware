@@ -33,6 +33,8 @@
 
 /* IWDG handle lives in main.c — refresh it inside long blocking delays */
 extern IWDG_HandleTypeDef hiwdg;
+extern volatile uint8_t g_boot_phase;
+extern const char g_fw_ver[];
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * USER CONFIG  —  change these two lines per device before flashing
@@ -51,18 +53,19 @@ extern IWDG_HandleTypeDef hiwdg;
 #define CLIENT_ID "pump" PUMP_ID
 
 /* ── Topics ─────────────────────────────────────────────────────────────── */
-#define TOPIC_STATUS "pump/" PUMP_ID "/status"
-#define TOPIC_CMD    "pump/" PUMP_ID "/cmd"
-#define TOPIC_ALERTS "pump/" PUMP_ID "/alerts"
-#define TOPIC_OTA    "pump/" PUMP_ID "/ota"
+#define TOPIC_STATUS   "pump/" PUMP_ID "/status"
+#define TOPIC_CMD      "pump/" PUMP_ID "/cmd"
+#define TOPIC_ALERTS   "pump/" PUMP_ID "/alerts"
+#define TOPIC_OTA      "pump/" PUMP_ID "/ota"
+#define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
 
-/* ── Protection thresholds ──────────────────────────────────────────────── */
-#define V_OVERVOLTAGE 480.0f  /* V  — any L-L above this trips relay (415 V nominal +16%) */
-#define V_UNDERVOLTAGE 340.0f /* V  — any L-L below this trips relay (415 V nominal -18%) */
-#define V_PHASE_LOSS 200.0f   /* V  — L-L below this = phase lost (half of 415 V nominal) */
-#define DRY_RUN_AMPS 1.5f     /* A  — below this = dry running          */
-#define DRY_RUN_SECS 8        /* consecutive seconds before trip        */
-#define LOCKOUT_MS 300000UL   /* 5 min lockout after dry-run trip       */
+/* ── Protection thresholds — runtime configurable via TOPIC_SETTINGS ─────── */
+static float cfg_ov    = 480.0f; /* V  — any L-N above this trips relay    */
+static float cfg_uv    = 340.0f; /* V  — any L-N below this trips relay    */
+static float cfg_pl    = 200.0f; /* V  — L-N below this = phase lost       */
+static float cfg_dry_i = 1.5f;   /* A  — below this = dry running          */
+static int   cfg_dry_t = 8;      /* s  — consecutive seconds before trip   */
+#define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
 
 /* ── Heartbeat interval (event-driven: also publish on every state change) ── */
 #define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
@@ -109,6 +112,7 @@ static uint32_t state_entered_ms = 0;
 static bool relay1 = false;
 static bool relay2 = false;
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
+static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
 static uint8_t dry_run_count = 0;
 static bool dry_run_tripped = false;
 static uint32_t lockout_until = 0;
@@ -348,20 +352,32 @@ static void publish_status(void)
     fmt_f1(sv3, sizeof(sv3), v3);
     fmt_f2(sci, sizeof(sci), i);
 
-    char payload[256];
+    char scfg_ov[10], scfg_uv[10], scfg_pl[10], scfg_dry_i[10];
+    fmt_f1(scfg_ov,    sizeof(scfg_ov),    cfg_ov);
+    fmt_f1(scfg_uv,    sizeof(scfg_uv),    cfg_uv);
+    fmt_f1(scfg_pl,    sizeof(scfg_pl),    cfg_pl);
+    fmt_f2(scfg_dry_i, sizeof(scfg_dry_i), cfg_dry_i);
+
+    char payload[420];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"v1\":%s,\"v2\":%s,\"v3\":%s,"
              "\"current\":%s,"
              "\"dry_run\":%s,\"online\":true,"
-             "\"mb_ok\":%d,\"mb_rx\":%d,\"rssi\":%d}",
+             "\"mb_ok\":%d,\"mb_rx\":%d,\"rssi\":%d,\"boot_phase\":%u,"
+             "\"fw\":\"%s\","
+             "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
+             "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              sv1, sv2, sv3, sci,
              dry_run_tripped ? "true" : "false",
              Modbus_IsDataValid() ? 1 : 0,
              (int)Modbus_GetLastRx(),
-             (int)last_rssi);
+             (int)last_rssi,
+             (unsigned)g_boot_phase,
+             g_fw_ver,
+             scfg_ov, scfg_uv, scfg_pl, scfg_dry_i, cfg_dry_t);
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -391,9 +407,9 @@ static void run_protection(void)
     float v3 = Sensor_ReadVoltagePhase3();
     float i = Sensor_ReadCurrentACS712();
 
-    bool ov = (v1 > V_OVERVOLTAGE || v2 > V_OVERVOLTAGE || v3 > V_OVERVOLTAGE);
-    bool uv = (v1 < V_UNDERVOLTAGE || v2 < V_UNDERVOLTAGE || v3 < V_UNDERVOLTAGE);
-    bool pl = (v1 < V_PHASE_LOSS || v2 < V_PHASE_LOSS || v3 < V_PHASE_LOSS);
+    bool ov = (v1 > cfg_ov || v2 > cfg_ov || v3 > cfg_ov);
+    bool uv = (v1 < cfg_uv || v2 < cfg_uv || v3 < cfg_uv);
+    bool pl = (v1 < cfg_pl || v2 < cfg_pl || v3 < cfg_pl);
 
     /* voltage protection disabled until meter wiring verified
     if ((ov || uv || pl) && relay1)
@@ -408,10 +424,10 @@ static void run_protection(void)
     /* dry run detection disabled until current sensor wiring verified
     if (relay1 && !dry_run_tripped)
     {
-        if (i < DRY_RUN_AMPS)
+        if (i < cfg_dry_i)
         {
             dry_run_count++;
-            if (dry_run_count >= DRY_RUN_SECS)
+            if (dry_run_count >= (uint8_t)cfg_dry_t)
             {
                 dry_run_tripped = true;
                 lockout_until = HAL_GetTick() + LOCKOUT_MS;
@@ -453,6 +469,38 @@ static int extract_int(const char *json, const char *key)
     while (*p == ' ')
         p++;
     return atoi(p);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * JSON float field extractor — returns float value for key, or def if missing
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Lightweight float parser — avoids newlib strtod() bloat (~15 KB).
+ * Handles formats like "1.5", "480", "-2.3". */
+static float parse_float_lite(const char *s)
+{
+    while (*s == ' ') s++;
+    float sign = 1.0f;
+    if (*s == '-') { sign = -1.0f; s++; }
+    float result = 0.0f;
+    while (*s >= '0' && *s <= '9') { result = result * 10.0f + (*s++ - '0'); }
+    if (*s == '.') {
+        s++;
+        float frac = 0.1f;
+        while (*s >= '0' && *s <= '9') { result += (*s++ - '0') * frac; frac *= 0.1f; }
+    }
+    return sign * result;
+}
+
+static float extract_float(const char *json, const char *key, float def)
+{
+    char search[32];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return def;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    return parse_float_lite(p);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -498,6 +546,19 @@ static bool extract_ota_url_any(const char *text, char *out, size_t max)
 static void modem_ota_start(const char *url); /* forward declaration */
 static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
 static bool modem_is_exact_reboot_urc(const char *line);
+
+/* Apply protection settings from JSON payload */
+static void apply_settings(const char *json)
+{
+    float v;
+    int   t;
+    v = extract_float(json, "ov",    cfg_ov);    if (v > 0.0f) cfg_ov    = v;
+    v = extract_float(json, "uv",    cfg_uv);    if (v > 0.0f) cfg_uv    = v;
+    v = extract_float(json, "pl",    cfg_pl);    if (v > 0.0f) cfg_pl    = v;
+    v = extract_float(json, "dry_i", cfg_dry_i); if (v > 0.0f) cfg_dry_i = v;
+    t = extract_int(json, "dry_t");              if (t > 0)    cfg_dry_t = t;
+    Debug_Print("[CFG] Settings updated\r\n");
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Line processor — called for every complete line received from EC200U
@@ -553,6 +614,14 @@ static void process_line(const char *line)
         if (json)
         {
             recv_payload_pending = false;
+            /* Settings topic */
+            if (strstr(recv_pending_topic, TOPIC_SETTINGS))
+            {
+                apply_settings(json);
+                recv_pending_topic[0] = '\0';
+                return;
+            }
+            recv_pending_topic[0] = '\0';
             /* OTA command: {"url":"https://..."} */
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
@@ -604,6 +673,12 @@ static void process_line(const char *line)
         char *json = strchr(line, '{');
         if (json)
         {
+            /* Settings topic inline: check topic in the +QMTRECV line */
+            if (strstr(line, TOPIC_SETTINGS))
+            {
+                apply_settings(json);
+                return;
+            }
             /* OTA command: {"url":"https://..."} */
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
@@ -647,8 +722,18 @@ static void process_line(const char *line)
         if (strchr(line, '"'))
         {
             /* Has quoted topic but no '{': response header from AT+QMTRECV.
-             * Payload arrives on the next line.                             */
+             * Payload arrives on the next line — store topic for dispatch.  */
             recv_payload_pending = true;
+            /* Extract topic name from: +QMTRECV: 0,0,"pump/01/settings",N  */
+            const char *tq = strchr(line, '"');
+            if (tq)
+            {
+                tq++;
+                size_t ti = 0;
+                while (*tq && *tq != '"' && ti < sizeof(recv_pending_topic) - 1)
+                    recv_pending_topic[ti++] = *tq++;
+                recv_pending_topic[ti] = '\0';
+            }
         }
         else
         {
@@ -662,6 +747,7 @@ static void process_line(const char *line)
                 snprintf(recv_cmd, sizeof(recv_cmd), "AT+QMTRECV=0,%d", msgid);
                 modem_cmd(recv_cmd);
                 recv_payload_pending = true;
+                recv_pending_topic[0] = '\0'; /* topic unknown in buffer-mode */
             }
         }
         return;
@@ -948,13 +1034,21 @@ static void process_line(const char *line)
         }
         if (strstr(line, "+QMTSUB: 0,2,0"))
         {
-            /* OTA topic subscribed — fully connected now */
-            Debug_Print("[MQTT] Subscribed to " TOPIC_OTA "\r\n");
+            /* OTA topic subscribed — now subscribe to settings topic */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_OTA " — subscribing settings...\r\n");
+            char sub_cmd[64];
+            snprintf(sub_cmd, sizeof(sub_cmd), "AT+QMTSUB=0,3,\"%s\",1", TOPIC_SETTINGS);
+            modem_cmd(sub_cmd);
+        }
+        if (strstr(line, "+QMTSUB: 0,3,0"))
+        {
+            /* Settings topic subscribed — fully connected now */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_SETTINGS "\r\n");
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
             /* Do NOT flush here — the broker delivers any retained message
-             * (e.g. pump/01/ota) immediately after +QMTSUB: 0,2,0.  A flush
+             * (e.g. pump/01/ota) immediately after subscribe.  A flush
              * loop at 115200 baud has no 1ms gap and swallows the entire
              * QMTRECV line, silently discarding the OTA trigger.
              * Just reset the partial-line buffer; stale "OK" or duplicate
@@ -1416,7 +1510,7 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * RCC_CSR_SFTRSTF is set by NVIC_SystemReset; PORRSTF is set on power-on.
      * Used below to choose the initial MQTT state. */
     uint32_t reset_csr = RCC->CSR;
-    bool ota_reboot = (reset_csr & RCC_CSR_SFTRSTF) != 0;
+    bool ota_reboot = ((reset_csr & RCC_CSR_SFTRSTF) != 0) && OTA_WasRebootPending();
     {
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "[MODEM] Reset CSR: 0x%08lX\r\n", (unsigned long)reset_csr);

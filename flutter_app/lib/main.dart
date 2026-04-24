@@ -78,6 +78,16 @@ class _PumpDashboardState extends State<PumpDashboard> {
       appBar: AppBar(
         title: const Text('Pump Controller'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Protection Settings',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const SettingsPage()),
+            ),
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
@@ -798,6 +808,249 @@ class _AlertChip extends StatelessWidget {
       backgroundColor: Colors.red.shade100,
       side: BorderSide(color: Colors.red.shade300),
       padding: EdgeInsets.zero,
+    );
+  }
+}
+
+// ─── Protection Settings page ─────────────────────────────────────────────────
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  final db = FirebaseDatabase.instance;
+  final _formKey = GlobalKey<FormState>();
+
+  final _ovCtrl    = TextEditingController();
+  final _uvCtrl    = TextEditingController();
+  final _plCtrl    = TextEditingController();
+  final _dryICtrl  = TextEditingController();
+  final _dryTCtrl  = TextEditingController();
+
+  bool _loading = true;
+  bool _saving  = false;
+
+  // Current values echoed back by device (from status)
+  double? _devOv, _devUv, _devPl, _devDryI;
+  int?    _devDryT;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _listenDeviceSettings();
+  }
+
+  Future<void> _load() async {
+    final snap = await db.ref('pumps/pump01/settings').get();
+    final s = snap.value as Map?;
+    setState(() {
+      _ovCtrl.text   = (s?['ov']    ?? 480).toString();
+      _uvCtrl.text   = (s?['uv']    ?? 340).toString();
+      _plCtrl.text   = (s?['pl']    ?? 200).toString();
+      _dryICtrl.text = (s?['dry_i'] ?? 1.5).toString();
+      _dryTCtrl.text = (s?['dry_t'] ?? 8).toString();
+      _loading = false;
+    });
+  }
+
+  void _listenDeviceSettings() {
+    db.ref('pumps/pump01/status').onValue.listen((event) {
+      final s = event.snapshot.value as Map?;
+      if (s == null || !mounted) return;
+      setState(() {
+        _devOv   = (s['cfg_ov']    as num?)?.toDouble();
+        _devUv   = (s['cfg_uv']    as num?)?.toDouble();
+        _devPl   = (s['cfg_pl']    as num?)?.toDouble();
+        _devDryI = (s['cfg_dry_i'] as num?)?.toDouble();
+        _devDryT = (s['cfg_dry_t'] as num?)?.toInt();
+      });
+    });
+  }
+
+  Future<void> _save() async {
+    if (!_formKey.currentState!.validate()) return;
+    final ov    = double.parse(_ovCtrl.text);
+    final uv    = double.parse(_uvCtrl.text);
+    final pl    = double.parse(_plCtrl.text);
+    final dryI  = double.parse(_dryICtrl.text);
+    final dryT  = int.parse(_dryTCtrl.text);
+
+    setState(() => _saving = true);
+    await db.ref('pumps/pump01/settings').set({
+      'ov': ov, 'uv': uv, 'pl': pl, 'dry_i': dryI, 'dry_t': dryT,
+    });
+    setState(() => _saving = false);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Settings saved — device will apply within seconds')),
+      );
+    }
+  }
+
+  String? _validatePositive(String? v) {
+    if (v == null || v.isEmpty) return 'Required';
+    if (double.tryParse(v) == null || double.parse(v) <= 0) return 'Must be > 0';
+    return null;
+  }
+
+  String? _validateOv(String? v) {
+    final err = _validatePositive(v);
+    if (err != null) return err;
+    final uv = double.tryParse(_uvCtrl.text) ?? 0;
+    if (double.parse(v!) <= uv) return 'Must be > undervoltage';
+    return null;
+  }
+
+  String? _validateUv(String? v) {
+    final err = _validatePositive(v);
+    if (err != null) return err;
+    final pl = double.tryParse(_plCtrl.text) ?? 0;
+    if (double.parse(v!) <= pl) return 'Must be > phase loss';
+    return null;
+  }
+
+  String? _validateInt(String? v) {
+    if (v == null || v.isEmpty) return 'Required';
+    if (int.tryParse(v) == null || int.parse(v) <= 0) return 'Must be a whole number > 0';
+    return null;
+  }
+
+  Widget _field(String label, TextEditingController ctrl, String unit,
+      String? Function(String?) validator, {String? hint}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: TextFormField(
+        controller: ctrl,
+        decoration: InputDecoration(
+          labelText: label,
+          suffixText: unit,
+          hintText: hint,
+          border: const OutlineInputBorder(),
+          isDense: true,
+        ),
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+        validator: validator,
+      ),
+    );
+  }
+
+  Widget _deviceRow(String label, String? value) {
+    return Row(
+      children: [
+        Text('$label: ', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        Text(value ?? '—', style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
+      ],
+    );
+  }
+
+  @override
+  void dispose() {
+    _ovCtrl.dispose(); _uvCtrl.dispose(); _plCtrl.dispose();
+    _dryICtrl.dispose(); _dryTCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Protection Settings'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('Voltage Protection',
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                            const SizedBox(height: 12),
+                            _field('Over Voltage', _ovCtrl, 'V', _validateOv,
+                                hint: 'e.g. 480'),
+                            _field('Under Voltage', _uvCtrl, 'V', _validateUv,
+                                hint: 'e.g. 340'),
+                            _field('Phase Loss', _plCtrl, 'V', _validatePositive,
+                                hint: 'e.g. 200'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('Dry Run Protection',
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                            const SizedBox(height: 12),
+                            _field('Current Threshold', _dryICtrl, 'A', _validatePositive,
+                                hint: 'e.g. 1.5'),
+                            _field('Trip Delay', _dryTCtrl, 's', _validateInt,
+                                hint: 'e.g. 8'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    if (_devOv != null)
+                      Card(
+                        color: Colors.blue.shade50,
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('Active on device',
+                                  style: TextStyle(fontWeight: FontWeight.bold,
+                                      fontSize: 13, color: Colors.blueGrey)),
+                              const SizedBox(height: 6),
+                              _deviceRow('OV', '${_devOv?.toStringAsFixed(0)} V'),
+                              _deviceRow('UV', '${_devUv?.toStringAsFixed(0)} V'),
+                              _deviceRow('PL', '${_devPl?.toStringAsFixed(0)} V'),
+                              _deviceRow('Dry I', '${_devDryI?.toStringAsFixed(1)} A'),
+                              _deviceRow('Dry T', '$_devDryT s'),
+                            ],
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 16),
+                    ElevatedButton(
+                      onPressed: _saving ? null : _save,
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      child: _saving
+                          ? const SizedBox(height: 20, width: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Text('Save Settings',
+                              style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Settings are saved to Firebase and forwarded to the device via MQTT.\n'
+                      'The device applies them immediately and echoes back the active values above.',
+                      style: TextStyle(fontSize: 11, color: Colors.grey),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            ),
     );
   }
 }
