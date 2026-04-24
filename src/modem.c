@@ -614,8 +614,11 @@ static void process_line(const char *line)
         if (json)
         {
             recv_payload_pending = false;
-            /* Settings topic */
-            if (strstr(recv_pending_topic, TOPIC_SETTINGS))
+            /* Settings topic — check recv_pending_topic (split-line) OR
+             * the full line (inline response after AT+QMTRECV poll where
+             * recv_pending_topic was cleared in the buffer-mode handler). */
+            if (strstr(recv_pending_topic, TOPIC_SETTINGS) ||
+                strstr(line, TOPIC_SETTINGS))
             {
                 apply_settings(json);
                 recv_pending_topic[0] = '\0';
