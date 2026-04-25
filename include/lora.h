@@ -13,7 +13,7 @@
  * printed to the serial monitor via Debug_Print.
  *
  * AT settings (must match sender):
- *   ADDRESS=1, NETWORKID=5, BAND=865000000 (865 MHz)
+ *   ADDRESS=2 (this device), NETWORKID=18, BAND=865000000 (865 MHz), CRFOP=22
  *   PARAMETER=9,7,1,12  (SF9, BW125, CR4/5, Preamble=12)
  */
 void LoRa_Init(UART_HandleTypeDef *huart);

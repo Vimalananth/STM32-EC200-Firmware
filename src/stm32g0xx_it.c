@@ -80,17 +80,16 @@ void NMI_Handler(void)
 
 /**
   * @brief This function handles Hard fault interrupt.
+  *        Immediately resets the MCU so IWDG does not fire and the board
+  *        recovers.  On next boot, [MODEM] Reset flags will show "SFTRST"
+  *        (software reset) instead of "IWDG PIN", identifying the fault.
   */
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  NVIC_SystemReset();   /* Reset immediately — board recovers, log shows SFTRST */
   /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+  while (1) {}          /* unreachable, keeps compiler happy */
 }
 
 /**

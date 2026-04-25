@@ -66,6 +66,7 @@ bool OTA_ShouldYieldRx(void);
  *   - Skip queued MQTT publishes
  *   - Forward all AT lines to OTA_HandleLine()                              */
 bool OTA_IsActive(void);
+bool OTA_WasRebootPending(void); /* true only after intentional OTA_ST_REBOOT reset */
 
 /* Binary passthrough for AT+QFREAD raw data.
  * After modem.c sees "CONNECT N\n", it calls OTA_SetBinaryExpect(N), then

@@ -2,9 +2,40 @@
 // Flutter pump controller app
 // Reads pump/status from Firebase, writes pump/cmd
 
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
+
+// ─── Site configuration ───────────────────────────────────────────────────────
+class SiteConfig {
+  final String id;
+  final String name;
+  final String meterPumpId; // pump whose status feeds PowerMeterCard
+  final String deviceId;    // device that owns relay1/relay2 (Firebase cmd path)
+  final List<String> pumpIds; // index 0=relay1, 1=relay2 on deviceId
+
+  const SiteConfig({
+    required this.id,
+    required this.name,
+    required this.meterPumpId,
+    required this.deviceId,
+    required this.pumpIds,
+  });
+}
+
+const kSites = [
+  SiteConfig(
+    id: 'site01',
+    name: 'Site 1',
+    meterPumpId: 'pump01',
+    deviceId: 'pump01',
+    pumpIds: ['pump01', 'pump02'],
+  ),
+  // Add site02 when second hardware is ready:
+  // SiteConfig(id:'site02', name:'Site 2', meterPumpId:'pump03',
+  //            deviceId:'pump03', pumpIds:['pump03','pump04']),
+];
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -45,31 +76,34 @@ class PumpDashboard extends StatefulWidget {
 class _PumpDashboardState extends State<PumpDashboard> {
   final db = FirebaseDatabase.instance;
 
-  // Actual device relay states tracked here for mutual exclusion
-  final Map<String, bool> _pumpOn = {'pump01': false, 'pump02': false};
+  // Relay states per pump, keyed by pumpId — populated from kSites
+  final Map<String, bool> _pumpOn = {
+    for (final s in kSites)
+      for (final p in s.pumpIds) p: false,
+  };
 
   @override
   void initState() {
     super.initState();
-    // Both pumps are on the same device — relay1 = pump01, relay2 = pump02
-    db.ref('pumps/pump01/status/relay1_state').onValue.listen((event) {
-      if (mounted) setState(() => _pumpOn['pump01'] = (event.snapshot.value ?? 0) == 1);
-    });
-    db.ref('pumps/pump01/status/relay2_state').onValue.listen((event) {
-      if (mounted) setState(() => _pumpOn['pump02'] = (event.snapshot.value ?? 0) == 1);
-    });
+    // Listen to each pump's relay state via its site's device
+    for (final site in kSites) {
+      for (var i = 0; i < site.pumpIds.length; i++) {
+        final pumpId = site.pumpIds[i];
+        final relayField = 'relay${i + 1}_state';
+        db.ref('pumps/${site.deviceId}/status/$relayField').onValue.listen((event) {
+          if (mounted) setState(() => _pumpOn[pumpId] = (event.snapshot.value ?? 0) == 1);
+        });
+      }
+    }
   }
 
-  // Called by PumpCard when user presses the pump button.
-  // Both pumps are on the same device: relay1 = pump01, relay2 = pump02.
-  // Always writes to pumps/pump01/cmd so bridge forwards to pump/01/cmd.
   Future<void> _handlePumpToggle(String pumpId, bool turnOn) async {
-    // Only send the field for the pump being toggled.
-    // Sending both fields would pulse the wrong coil on the latching relay.
-    final Map<String, dynamic> cmd = {'ts': DateTime.now().millisecondsSinceEpoch};
-    if (pumpId == 'pump01') cmd['relay1'] = turnOn ? 1 : 0;
-    if (pumpId == 'pump02') cmd['relay2'] = turnOn ? 1 : 0;
-    await db.ref('pumps/pump01/cmd').set(cmd);
+    final site = kSites.firstWhere((s) => s.pumpIds.contains(pumpId));
+    final relayIndex = site.pumpIds.indexOf(pumpId) + 1;
+    await db.ref('pumps/${site.deviceId}/cmd').set({
+      'relay$relayIndex': turnOn ? 1 : 0,
+      'ts': DateTime.now().millisecondsSinceEpoch,
+    });
   }
 
   @override
@@ -79,6 +113,14 @@ class _PumpDashboardState extends State<PumpDashboard> {
         title: const Text('Pump Controller'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'Logs',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const LogsPage()),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.settings),
             tooltip: 'Protection Settings',
@@ -93,25 +135,12 @@ class _PumpDashboardState extends State<PumpDashboard> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            const PowerMeterCard(),
-            const SizedBox(height: 16),
-            PumpCard(
-              pumpId: 'pump01',
-              pumpName: 'Pump 1',
-              otherPumpOn: _pumpOn['pump02'] ?? false,
-              otherPumpName: 'Pump 2',
-              onPumpToggle: (val) => _handlePumpToggle('pump01', val),
-            ),
-            const SizedBox(height: 16),
-            PumpCard(
-              pumpId: 'pump02',
-              pumpName: 'Pump 2',
-              otherPumpOn: _pumpOn['pump01'] ?? false,
-              otherPumpName: 'Pump 1',
-              onPumpToggle: (val) => _handlePumpToggle('pump02', val),
-            ),
-            const SizedBox(height: 16),
-            const RotationScheduleCard(),
+            for (final site in kSites)
+              _SiteSection(
+                site: site,
+                pumpOn: _pumpOn,
+                onPumpToggle: _handlePumpToggle,
+              ),
           ],
         ),
       ),
@@ -119,9 +148,72 @@ class _PumpDashboardState extends State<PumpDashboard> {
   }
 }
 
+// ─── Site section — groups PowerMeter + Pumps + Rotation for one site ─────────
+class _SiteSection extends StatelessWidget {
+  final SiteConfig site;
+  final Map<String, bool> pumpOn;
+  final Future<void> Function(String pumpId, bool on) onPumpToggle;
+
+  const _SiteSection({
+    required this.site,
+    required this.pumpOn,
+    required this.onPumpToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (kSites.length > 1)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 8, 4, 4),
+            child: Text(
+              site.name,
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.bold),
+            ),
+          ),
+        PowerMeterCard(pumpId: site.meterPumpId),
+        const SizedBox(height: 16),
+        for (var i = 0; i < site.pumpIds.length; i++) ...[
+          PumpCard(
+            pumpId: site.pumpIds[i],
+            pumpName: 'Pump ${i + 1}',
+            deviceId: site.deviceId,
+            relayNum: i + 1,
+            otherPumpOn: site.pumpIds
+                .where((p) => p != site.pumpIds[i])
+                .any((p) => pumpOn[p] == true),
+            otherPumpName: 'Pump ${i == 0 ? 2 : 1}',
+            onPumpToggle: (val) => onPumpToggle(site.pumpIds[i], val),
+          ),
+          const SizedBox(height: 16),
+        ],
+        RotationScheduleCard(
+          siteId: site.id,
+          pump1Id: site.pumpIds[0],
+          pump2Id: site.pumpIds[1],
+        ),
+      ],
+    );
+  }
+}
+
 // ─── Rotation schedule card ───────────────────────────────────────────────────
 class RotationScheduleCard extends StatefulWidget {
-  const RotationScheduleCard({super.key});
+  final String siteId;
+  final String pump1Id;
+  final String pump2Id;
+
+  const RotationScheduleCard({
+    super.key,
+    required this.siteId,
+    required this.pump1Id,
+    required this.pump2Id,
+  });
   @override
   State<RotationScheduleCard> createState() => _RotationScheduleCardState();
 }
@@ -131,7 +223,7 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
 
   bool   _enabled         = false;
   int    _intervalMinutes = 240; // default 4 h
-  String _currentPump     = 'pump01';
+  late String _currentPump;
   int    _startedAt       = 0;
   bool   _expanded        = false;
 
@@ -149,14 +241,15 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
   @override
   void initState() {
     super.initState();
-    db.ref('rotation_schedule').onValue.listen((event) {
+    _currentPump = widget.pump1Id;
+    db.ref('sites/${widget.siteId}/rotation_schedule').onValue.listen((event) {
       final data = event.snapshot.value;
       if (data != null && mounted) {
         final s = Map<String, dynamic>.from(data as Map);
         setState(() {
           _enabled         = s['enabled']          ?? false;
           _intervalMinutes = (s['interval_minutes'] ?? 240) as int;
-          _currentPump     = s['current_pump']      ?? 'pump01';
+          _currentPump     = s['current_pump']      ?? widget.pump1Id;
           _startedAt       = (s['started_at']       ?? 0) as int;
         });
       }
@@ -175,13 +268,13 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
   }
 
   Future<void> _save() async {
-    await db.ref('rotation_schedule').update({
+    await db.ref('sites/${widget.siteId}/rotation_schedule').update({
       'enabled':          _enabled,
       'interval_minutes': _intervalMinutes,
     });
     if (!_enabled) {
       // clear started_at so it restarts cleanly when re-enabled
-      await db.ref('rotation_schedule/started_at').set(0);
+      await db.ref('sites/${widget.siteId}/rotation_schedule/started_at').set(0);
     }
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -192,7 +285,7 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
 
   @override
   Widget build(BuildContext context) {
-    final activePumpLabel = _currentPump == 'pump01' ? 'Pump 1' : 'Pump 2';
+    final activePumpLabel = _currentPump == widget.pump1Id ? 'Pump 1' : 'Pump 2';
     final remaining       = _timeRemaining();
 
     return Card(
@@ -299,6 +392,8 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
 class PumpCard extends StatefulWidget {
   final String pumpId;
   final String pumpName;
+  final String deviceId;
+  final int    relayNum;
   final bool otherPumpOn;
   final String otherPumpName;
   final Future<void> Function(bool) onPumpToggle;
@@ -307,6 +402,8 @@ class PumpCard extends StatefulWidget {
     super.key,
     required this.pumpId,
     required this.pumpName,
+    required this.deviceId,
+    required this.relayNum,
     required this.otherPumpOn,
     required this.otherPumpName,
     required this.onPumpToggle,
@@ -337,16 +434,12 @@ class _PumpCardState extends State<PumpCard> {
   }
 
   void _listenStatus() {
-    // Both pumps are on the same device — all status comes from pumps/pump01/status.
-    // pump01 uses relay1_state; pump02 uses relay2_state.
-    db.ref('pumps/pump01/status').onValue.listen((event) {
+    db.ref('pumps/${widget.deviceId}/status').onValue.listen((event) {
       final data = event.snapshot.value;
       if (data != null && mounted) {
         final s = Map<String, dynamic>.from(data as Map);
         setState(() {
-          _relay1Cmd = widget.pumpId == 'pump02'
-              ? (s['relay2_state'] ?? 0) == 1
-              : (s['relay1_state'] ?? 0) == 1;
+          _relay1Cmd = (s['relay${widget.relayNum}_state'] ?? 0) == 1;
         });
       }
     });
@@ -380,32 +473,38 @@ class _PumpCardState extends State<PumpCard> {
   }
 
   Future<void> _saveSchedule() async {
-    // Conflict check: prevent both pumps having the same ON time
+    // Conflict check: prevent same-site pumps having the same ON time
     if (_schedEnabled) {
-      final otherId = widget.pumpId == 'pump01' ? 'pump02' : 'pump01';
-      final otherSnap = await db.ref('pumps/$otherId/schedule').get();
-      if (otherSnap.exists) {
-        final other = Map<String, dynamic>.from(otherSnap.value as Map);
-        final otherEnabled = other['enabled'] ?? false;
-        if (otherEnabled) {
-          final otherOnHour = (other['on_hour'] ?? 8) as int;
-          final otherOnMin  = (other['on_min']  ?? 0) as int;
-          if (otherOnHour == _schedOnTime.hour &&
-              otherOnMin  == _schedOnTime.minute) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    'Conflict: ${otherId == "pump01" ? "Pump 1" : "Pump 2"} '
-                    'already turns ON at ${_fmt(_schedOnTime)}. '
-                    'Choose a different time.',
+      final site = kSites.firstWhere(
+        (s) => s.pumpIds.contains(widget.pumpId),
+        orElse: () => kSites.first,
+      );
+      for (final otherId in site.pumpIds.where((p) => p != widget.pumpId)) {
+        final otherSnap = await db.ref('pumps/$otherId/schedule').get();
+        if (otherSnap.exists) {
+          final other = Map<String, dynamic>.from(otherSnap.value as Map);
+          final otherEnabled = other['enabled'] ?? false;
+          if (otherEnabled) {
+            final otherOnHour = (other['on_hour'] ?? 8) as int;
+            final otherOnMin  = (other['on_min']  ?? 0) as int;
+            if (otherOnHour == _schedOnTime.hour &&
+                otherOnMin  == _schedOnTime.minute) {
+              if (mounted) {
+                final otherIdx = site.pumpIds.indexOf(otherId);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      'Conflict: Pump ${otherIdx + 1} '
+                      'already turns ON at ${_fmt(_schedOnTime)}. '
+                      'Choose a different time.',
+                    ),
+                    backgroundColor: Colors.red.shade700,
+                    duration: const Duration(seconds: 4),
                   ),
-                  backgroundColor: Colors.red.shade700,
-                  duration: const Duration(seconds: 4),
-                ),
-              );
+                );
+              }
+              return; // block save
             }
-            return; // block save
           }
         }
       }
@@ -657,7 +756,8 @@ class _PumpCardState extends State<PumpCard> {
 
 // ─── Shared power meter card ─────────────────────────────────────────────────
 class PowerMeterCard extends StatefulWidget {
-  const PowerMeterCard({super.key});
+  final String pumpId;
+  const PowerMeterCard({super.key, required this.pumpId});
   @override
   State<PowerMeterCard> createState() => _PowerMeterCardState();
 }
@@ -669,8 +769,7 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
   @override
   void initState() {
     super.initState();
-    // Power meter is wired to pump01's board
-    db.ref('pumps/pump01/status').onValue.listen((event) {
+    db.ref('pumps/${widget.pumpId}/status').onValue.listen((event) {
       final data = event.snapshot.value;
       if (data != null && mounted) {
         setState(() => _status = Map<String, dynamic>.from(data as Map));
@@ -823,18 +922,28 @@ class _SettingsPageState extends State<SettingsPage> {
   final db = FirebaseDatabase.instance;
   final _formKey = GlobalKey<FormState>();
 
-  final _ovCtrl    = TextEditingController();
-  final _uvCtrl    = TextEditingController();
-  final _plCtrl    = TextEditingController();
-  final _dryICtrl  = TextEditingController();
-  final _dryTCtrl  = TextEditingController();
+  final _ovCtrl   = TextEditingController();
+  final _uvCtrl   = TextEditingController();
+  final _plCtrl   = TextEditingController();
+  final _dryICtrl = TextEditingController();
+  final _dryTCtrl = TextEditingController();
+
+  String _pumpId       = 'pump01';  // selected pump
+  int?   _selectedHp;               // null=custom, 5=5HP, 75=7.5HP
+  bool   _dryRunEnabled = true;     // dry run optional
+
+  static const _hpPresets = {
+    5:  {'ov': 480.0, 'uv': 360.0, 'pl': 200.0, 'dry_i': 3.0, 'dry_t': 8},
+    75: {'ov': 480.0, 'uv': 360.0, 'pl': 200.0, 'dry_i': 4.5, 'dry_t': 8},
+  };
 
   bool _loading = true;
   bool _saving  = false;
 
-  // Current values echoed back by device (from status)
   double? _devOv, _devUv, _devPl, _devDryI;
-  int?    _devDryT;
+  int?    _devDryT, _devHp, _devDryEn;
+
+  StreamSubscription<DatabaseEvent>? _devSub;
 
   @override
   void initState() {
@@ -843,12 +952,19 @@ class _SettingsPageState extends State<SettingsPage> {
     _listenDeviceSettings();
   }
 
+  String get _settingsPath => 'pumps/$_pumpId/settings';
+  String get _statusPath   => 'pumps/$_pumpId/status';
+
   Future<void> _load() async {
-    final snap = await db.ref('pumps/pump01/settings').get();
+    setState(() => _loading = true);
+    final snap = await db.ref(_settingsPath).get();
     final s = snap.value as Map?;
     setState(() {
+      _selectedHp    = (s?['hp']     as num?)?.toInt();
+      // null dry_en → default true; 0 → false
+      _dryRunEnabled = (s?['dry_en'] as num?)?.toInt() != 0;
       _ovCtrl.text   = (s?['ov']    ?? 480).toString();
-      _uvCtrl.text   = (s?['uv']    ?? 340).toString();
+      _uvCtrl.text   = (s?['uv']    ?? 360).toString();
       _plCtrl.text   = (s?['pl']    ?? 200).toString();
       _dryICtrl.text = (s?['dry_i'] ?? 1.5).toString();
       _dryTCtrl.text = (s?['dry_t'] ?? 8).toString();
@@ -857,36 +973,54 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   void _listenDeviceSettings() {
-    db.ref('pumps/pump01/status').onValue.listen((event) {
+    _devSub?.cancel();
+    _devSub = db.ref(_statusPath).onValue.listen((event) {
       final s = event.snapshot.value as Map?;
       if (s == null || !mounted) return;
       setState(() {
-        _devOv   = (s['cfg_ov']    as num?)?.toDouble();
-        _devUv   = (s['cfg_uv']    as num?)?.toDouble();
-        _devPl   = (s['cfg_pl']    as num?)?.toDouble();
-        _devDryI = (s['cfg_dry_i'] as num?)?.toDouble();
-        _devDryT = (s['cfg_dry_t'] as num?)?.toInt();
+        _devOv    = (s['cfg_ov']     as num?)?.toDouble();
+        _devUv    = (s['cfg_uv']     as num?)?.toDouble();
+        _devPl    = (s['cfg_pl']     as num?)?.toDouble();
+        _devDryI  = (s['cfg_dry_i']  as num?)?.toDouble();
+        _devDryT  = (s['cfg_dry_t']  as num?)?.toInt();
+        _devHp    = (s['cfg_hp']     as num?)?.toInt();
+        _devDryEn = (s['cfg_dry_en'] as num?)?.toInt();
       });
     });
   }
 
+  void _onPumpChanged(String pump) {
+    _devSub?.cancel();
+    setState(() {
+      _pumpId = pump;
+      _loading = true;
+      _devOv = _devUv = _devPl = _devDryI = null;
+      _devDryT = _devHp = _devDryEn = null;
+    });
+    _load();
+    _listenDeviceSettings();
+  }
+
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
-    final ov    = double.parse(_ovCtrl.text);
-    final uv    = double.parse(_uvCtrl.text);
-    final pl    = double.parse(_plCtrl.text);
-    final dryI  = double.parse(_dryICtrl.text);
-    final dryT  = int.parse(_dryTCtrl.text);
+    final ov   = double.parse(_ovCtrl.text);
+    final uv   = double.parse(_uvCtrl.text);
+    final pl   = double.parse(_plCtrl.text);
+    final dryI = _dryRunEnabled ? double.parse(_dryICtrl.text) : 0.0;
+    final dryT = _dryRunEnabled ? int.parse(_dryTCtrl.text)    : 0;
 
     setState(() => _saving = true);
-    await db.ref('pumps/pump01/settings').set({
-      'ov': ov, 'uv': uv, 'pl': pl, 'dry_i': dryI, 'dry_t': dryT,
+    await db.ref(_settingsPath).set({
+      'ov': ov, 'uv': uv, 'pl': pl,
+      'dry_i': dryI, 'dry_t': dryT,
+      'dry_en': _dryRunEnabled ? 1 : 0,
+      if (_selectedHp != null) 'hp': _selectedHp,
     });
     setState(() => _saving = false);
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Settings saved — device will apply within seconds')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Settings saved for ${_pumpId == 'pump01' ? 'Pump 1' : 'Pump 2'}'),
+      ));
     }
   }
 
@@ -937,17 +1071,18 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  Widget _deviceRow(String label, String? value) {
+  Widget _deviceRow(String label, String value) {
     return Row(
       children: [
         Text('$label: ', style: const TextStyle(fontSize: 12, color: Colors.grey)),
-        Text(value ?? '—', style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
+        Text(value, style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
       ],
     );
   }
 
   @override
   void dispose() {
+    _devSub?.cancel();
     _ovCtrl.dispose(); _uvCtrl.dispose(); _plCtrl.dispose();
     _dryICtrl.dispose(); _dryTCtrl.dispose();
     super.dispose();
@@ -969,6 +1104,77 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
+                    // ── Pump selection ──────────────────────────────────
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('Pump Selection',
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                            const SizedBox(height: 12),
+                            SegmentedButton<String>(
+                              segments: const [
+                                ButtonSegment(value: 'pump01', label: Text('Pump 1')),
+                                ButtonSegment(value: 'pump02', label: Text('Pump 2')),
+                              ],
+                              selected: {_pumpId},
+                              onSelectionChanged: (s) => _onPumpChanged(s.first),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // ── HP rating ───────────────────────────────────────
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('Pump Rating',
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                            const SizedBox(height: 12),
+                            DropdownButtonFormField<int?>(
+                              key: ValueKey(_selectedHp),
+                              initialValue: _selectedHp,
+                              decoration: const InputDecoration(
+                                labelText: 'Select Rating',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                              items: const [
+                                DropdownMenuItem(value: null, child: Text('Custom')),
+                                DropdownMenuItem(value: 5,    child: Text('5 HP  (3.7 kW)')),
+                                DropdownMenuItem(value: 75,   child: Text('7.5 HP  (5.6 kW)')),
+                              ],
+                              onChanged: (val) {
+                                setState(() {
+                                  _selectedHp = val;
+                                  if (val != null && _hpPresets.containsKey(val)) {
+                                    final p = _hpPresets[val]!;
+                                    _ovCtrl.text   = p['ov'].toString();
+                                    _uvCtrl.text   = p['uv'].toString();
+                                    _plCtrl.text   = p['pl'].toString();
+                                    _dryICtrl.text = p['dry_i'].toString();
+                                    _dryTCtrl.text = p['dry_t'].toString();
+                                  }
+                                });
+                              },
+                            ),
+                            const SizedBox(height: 6),
+                            const Text(
+                              'Selecting a rating fills preset thresholds. You can still edit values below.',
+                              style: TextStyle(fontSize: 11, color: Colors.grey),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // ── Voltage protection ──────────────────────────────
                     Card(
                       child: Padding(
                         padding: const EdgeInsets.all(16),
@@ -978,35 +1184,55 @@ class _SettingsPageState extends State<SettingsPage> {
                             const Text('Voltage Protection',
                                 style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                             const SizedBox(height: 12),
-                            _field('Over Voltage', _ovCtrl, 'V', _validateOv,
+                            _field('Over Voltage',  _ovCtrl, 'V', _validateOv,
                                 hint: 'e.g. 480'),
                             _field('Under Voltage', _uvCtrl, 'V', _validateUv,
-                                hint: 'e.g. 340'),
-                            _field('Phase Loss', _plCtrl, 'V', _validatePositive,
+                                hint: 'e.g. 360'),
+                            _field('Phase Loss',    _plCtrl, 'V', _validatePositive,
                                 hint: 'e.g. 200'),
                           ],
                         ),
                       ),
                     ),
                     const SizedBox(height: 12),
+                    // ── Dry run protection (optional) ───────────────────
                     Card(
                       child: Padding(
                         padding: const EdgeInsets.all(16),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Text('Dry Run Protection',
-                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                            const SizedBox(height: 12),
-                            _field('Current Threshold', _dryICtrl, 'A', _validatePositive,
-                                hint: 'e.g. 1.5'),
-                            _field('Trip Delay', _dryTCtrl, 's', _validateInt,
-                                hint: 'e.g. 8'),
+                            Row(
+                              children: [
+                                const Text('Dry Run Protection',
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                                const Spacer(),
+                                Switch(
+                                  value: _dryRunEnabled,
+                                  onChanged: (v) => setState(() => _dryRunEnabled = v),
+                                ),
+                              ],
+                            ),
+                            if (_dryRunEnabled) ...[
+                              const SizedBox(height: 12),
+                              _field('Current Threshold', _dryICtrl, 'A', _validatePositive,
+                                  hint: 'e.g. 3.0'),
+                              _field('Trip Delay', _dryTCtrl, 's', _validateInt,
+                                  hint: 'e.g. 8'),
+                            ] else
+                              const Padding(
+                                padding: EdgeInsets.only(top: 8),
+                                child: Text(
+                                  'Disabled — pump runs without current monitoring.',
+                                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                                ),
+                              ),
                           ],
                         ),
                       ),
                     ),
                     const SizedBox(height: 12),
+                    // ── Active on device ────────────────────────────────
                     if (_devOv != null)
                       Card(
                         color: Colors.blue.shade50,
@@ -1019,11 +1245,17 @@ class _SettingsPageState extends State<SettingsPage> {
                                   style: TextStyle(fontWeight: FontWeight.bold,
                                       fontSize: 13, color: Colors.blueGrey)),
                               const SizedBox(height: 6),
-                              _deviceRow('OV', '${_devOv?.toStringAsFixed(0)} V'),
-                              _deviceRow('UV', '${_devUv?.toStringAsFixed(0)} V'),
-                              _deviceRow('PL', '${_devPl?.toStringAsFixed(0)} V'),
-                              _deviceRow('Dry I', '${_devDryI?.toStringAsFixed(1)} A'),
-                              _deviceRow('Dry T', '$_devDryT s'),
+                              if (_devHp != null && _devHp! > 0)
+                                _deviceRow('Rating', _devHp == 75 ? '7.5 HP' : '$_devHp HP'),
+                              _deviceRow('OV',    '${_devOv?.toStringAsFixed(0)} V'),
+                              _deviceRow('UV',    '${_devUv?.toStringAsFixed(0)} V'),
+                              _deviceRow('PL',    '${_devPl?.toStringAsFixed(0)} V'),
+                              if (_devDryEn != null)
+                                _deviceRow('Dry Run', _devDryEn == 1 ? 'Enabled' : 'Disabled'),
+                              if (_devDryEn == 1) ...[
+                                _deviceRow('Dry I', '${_devDryI?.toStringAsFixed(1)} A'),
+                                _deviceRow('Dry T', '$_devDryT s'),
+                              ],
                             ],
                           ),
                         ),
@@ -1051,6 +1283,173 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               ),
             ),
+    );
+  }
+}
+
+// ─── Logs page ────────────────────────────────────────────────────────────────
+class LogsPage extends StatefulWidget {
+  const LogsPage({super.key});
+  @override
+  State<LogsPage> createState() => _LogsPageState();
+}
+
+class _LogsPageState extends State<LogsPage> {
+  final db = FirebaseDatabase.instance;
+  String _pumpId = 'pump01';
+  List<Map<String, dynamic>> _logs = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadLogs();
+  }
+
+  Future<void> _loadLogs() async {
+    setState(() => _loading = true);
+    final snap = await db
+        .ref('pumps/$_pumpId/logs')
+        .orderByKey()
+        .limitToLast(60)
+        .get();
+    final data = snap.value as Map?;
+    if (data == null) {
+      setState(() { _logs = []; _loading = false; });
+      return;
+    }
+    final entries = data.entries.toList()
+      ..sort((a, b) => b.key.toString().compareTo(a.key.toString()));
+    setState(() {
+      _logs = entries.map((e) =>
+          Map<String, dynamic>.from(e.value as Map)).toList();
+      _loading = false;
+    });
+  }
+
+  void _onPumpChanged(String pump) {
+    setState(() => _pumpId = pump);
+    _loadLogs();
+  }
+
+  String _formatRunTime(int s) {
+    if (s < 60)   return '${s}s';
+    if (s < 3600) return '${s ~/ 60}m ${s % 60}s';
+    return '${s ~/ 3600}h ${(s % 3600) ~/ 60}m';
+  }
+
+  String _formatTs(int tsMs) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(tsMs).toLocal();
+    final d = '${dt.day.toString().padLeft(2,'0')}/'
+              '${dt.month.toString().padLeft(2,'0')}';
+    final t = '${dt.hour.toString().padLeft(2,'0')}:'
+              '${dt.minute.toString().padLeft(2,'0')}';
+    return '$d  $t';
+  }
+
+  String _reasonLabel(String r) {
+    const m = {
+      'manual':       'Manual',
+      'sched':        'Schedule',
+      'rot':          'Rotation',
+      'overvoltage':  'Overvoltage',
+      'undervoltage': 'Undervoltage',
+      'phase_loss':   'Phase Loss',
+      'dry_run':      'Dry Run',
+      'lora':         'LoRa',
+    };
+    return m[r] ?? r;
+  }
+
+  bool _isProtectionTrip(String reason) =>
+      const {'overvoltage','undervoltage','phase_loss','dry_run'}.contains(reason);
+
+  IconData _icon(String event, String reason) {
+    if (event == 'on') return Icons.play_circle_outline;
+    if (_isProtectionTrip(reason)) {
+      return reason == 'dry_run' ? Icons.warning_amber : Icons.bolt;
+    }
+    if (reason == 'sched') return Icons.schedule;
+    if (reason == 'rot')   return Icons.swap_horiz;
+    return Icons.stop_circle_outlined;
+  }
+
+  Color _color(String event, String reason) {
+    if (event == 'on') return Colors.green.shade700;
+    if (_isProtectionTrip(reason)) return Colors.red.shade700;
+    return Colors.grey.shade700;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Pump Logs'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _loadLogs),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'pump01', label: Text('Pump 1')),
+                ButtonSegment(value: 'pump02', label: Text('Pump 2')),
+              ],
+              selected: {_pumpId},
+              onSelectionChanged: (s) => _onPumpChanged(s.first),
+            ),
+          ),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _logs.isEmpty
+                    ? const Center(
+                        child: Text('No logs yet.',
+                            style: TextStyle(color: Colors.grey)))
+                    : ListView.separated(
+                        itemCount: _logs.length,
+                        separatorBuilder: (_, __) =>
+                            const Divider(height: 1, indent: 56),
+                        itemBuilder: (ctx, i) {
+                          final log    = _logs[i];
+                          final event  = log['event']  as String? ?? '';
+                          final reason = log['reason'] as String? ?? '';
+                          final runS   = (log['run_s'] as num?)?.toInt() ?? 0;
+                          final ts     = (log['ts']    as num?)?.toInt() ?? 0;
+                          final c = _color(event, reason);
+                          return ListTile(
+                            dense: true,
+                            leading: CircleAvatar(
+                              radius: 18,
+                              backgroundColor: c.withValues(alpha: 0.12),
+                              child: Icon(_icon(event, reason), color: c, size: 20),
+                            ),
+                            title: Text(
+                              '${event == 'on' ? 'ON' : 'OFF'}  ·  ${_reasonLabel(reason)}',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  color: c,
+                                  fontSize: 13),
+                            ),
+                            subtitle: event == 'off' && runS > 0
+                                ? Text('Run time: ${_formatRunTime(runS)}',
+                                    style: const TextStyle(fontSize: 12))
+                                : null,
+                            trailing: ts > 0
+                                ? Text(_formatTs(ts),
+                                    style: const TextStyle(
+                                        fontSize: 11, color: Colors.grey))
+                                : null,
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
     );
   }
 }

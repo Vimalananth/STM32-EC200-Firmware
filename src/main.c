@@ -21,7 +21,7 @@
 #include "modem.h"
 #include "modbus.h"
 #include "ota.h"
-#include "lora.h"
+/* #include "lora.h" */  /* LoRa disabled — not in use */
 #include <string.h>
 #include <stdio.h>
 
@@ -144,8 +144,8 @@ int main(void)
   g_boot_phase = 6;
   WDG_KICK();
 
-  MX_USART3_UART_Init();  /* Reyax RYL998 LoRa at 115200 baud */
-  LoRa_Init(&huart3);     /* send AT config commands (blocking, before IWDG) */
+  /* MX_USART3_UART_Init(); */  /* LoRa disabled — Reyax RYL998 not in use */
+  /* LoRa_Init(&huart3);    */
   g_boot_phase = 7;
   WDG_KICK();
 
@@ -185,7 +185,7 @@ int main(void)
   {
     g_boot_phase = 11;
     Modem_Process();
-    LoRa_Process();
+    /* LoRa_Process(); */  /* LoRa disabled */
     /* Temporary PA8 blink validation mode:
        keep RS485 driver control untouched by Modbus code so heartbeat owns PA8. */
     /* if (!OTA_IsActive()) {
