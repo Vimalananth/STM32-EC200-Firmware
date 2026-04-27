@@ -115,6 +115,7 @@ static uint32_t state_entered_ms = 0;
 static bool     relay1 = false;
 static bool     relay2 = false;
 static uint32_t relay1_on_tick = 0;  /* HAL_GetTick() when relay1 last turned ON */
+static uint32_t relay2_on_tick = 0;  /* HAL_GetTick() when relay2 last turned ON */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
 static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
 static uint8_t dry_run_count = 0;
@@ -404,20 +405,20 @@ static void publish_alert(bool ov, bool uv, bool pl, bool dr)
  * Relay log — publishes on/off events to TOPIC_LOG
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void log_relay_event(bool on, const char *reason)
+static void log_relay_event(int relay_num, bool on, const char *reason)
 {
-    char payload[80];
+    char payload[96];
+    uint32_t *on_tick = (relay_num == 2) ? &relay2_on_tick : &relay1_on_tick;
     if (on) {
-        relay1_on_tick = HAL_GetTick();
+        *on_tick = HAL_GetTick();
         snprintf(payload, sizeof(payload),
-                 "{\"event\":\"on\",\"reason\":\"%s\"}", reason);
+                 "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
     } else {
-        uint32_t run_s = relay1_on_tick
-                         ? (HAL_GetTick() - relay1_on_tick) / 1000 : 0;
-        relay1_on_tick = 0;
+        uint32_t run_s = *on_tick ? (HAL_GetTick() - *on_tick) / 1000 : 0;
+        *on_tick = 0;
         snprintf(payload, sizeof(payload),
-                 "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu}",
-                 reason, (unsigned long)run_s);
+                 "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
+                 reason, (unsigned long)run_s, relay_num);
     }
     queue_publish(TOPIC_LOG, payload);
 }
@@ -442,7 +443,7 @@ static void run_protection(void)
     {
         Relay1_Set(false);
         Relay2_Set(true);
-        log_relay_event(false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
+        log_relay_event(1, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
         publish_alert(ov, uv, pl, false);
         Debug_Print("[PROT] Voltage fault — pump OFF\r\n");
         return;
@@ -460,7 +461,7 @@ static void run_protection(void)
                 lockout_until = HAL_GetTick() + LOCKOUT_MS;
                 Relay1_Set(false);
                 Relay2_Set(true);
-                log_relay_event(false, "dry_run");
+                log_relay_event(1, false, "dry_run");
                 publish_alert(false, false, false, true);
                 Debug_Print("[PROT] Dry run — pump OFF + lockout\r\n");
             }
@@ -679,13 +680,18 @@ static void process_line(const char *line)
                     bool prev1 = relay1;
                     Relay1_Set(r1 == 1);
                     if (relay1 != prev1)
-                        log_relay_event(relay1, cmd_src[0] ? cmd_src : "manual");
+                        log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
                     Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
                 }
             }
             if (r2 >= 0)
             {
+                char cmd_src[16] = "";
+                extract_str(json, "src", cmd_src, sizeof(cmd_src));
+                bool prev2 = relay2;
                 Relay2_Set(r2 == 1);
+                if (relay2 != prev2)
+                    log_relay_event(2, relay2, cmd_src[0] ? cmd_src : "manual");
                 Debug_Print(r2 ? "[CMD] Relay2 ON\r\n" : "[CMD] Relay2 OFF\r\n");
             }
             return;
@@ -742,13 +748,18 @@ static void process_line(const char *line)
                     bool prev1 = relay1;
                     Relay1_Set(r1 == 1);
                     if (relay1 != prev1)
-                        log_relay_event(relay1, cmd_src[0] ? cmd_src : "manual");
+                        log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
                     Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
                 }
             }
             if (r2 >= 0)
             {
+                char cmd_src[16] = "";
+                extract_str(json, "src", cmd_src, sizeof(cmd_src));
+                bool prev2 = relay2;
                 Relay2_Set(r2 == 1);
+                if (relay2 != prev2)
+                    log_relay_event(2, relay2, cmd_src[0] ? cmd_src : "manual");
                 Debug_Print(r2 ? "[CMD] Relay2 ON\r\n" : "[CMD] Relay2 OFF\r\n");
             }
         }
