@@ -59,6 +59,9 @@ extern const char g_fw_ver[];
 #define TOPIC_OTA      "pump/" PUMP_ID "/ota"
 #define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
 #define TOPIC_LOG      "pump/" PUMP_ID "/log"
+/* pump02 — same STM32, separate MQTT device (relay2 = PB4/PB5) */
+#define TOPIC_CMD2     "pump/02/cmd"
+#define TOPIC_STATUS2  "pump/02/status"
 
 /* ── Protection thresholds — runtime configurable via TOPIC_SETTINGS ─────── */
 static float cfg_ov    = 480.0f; /* V  — any L-N above this trips relay    */
@@ -387,6 +390,16 @@ static void publish_status(void)
     queue_publish(TOPIC_STATUS, payload);
 }
 
+static void publish_status2(void)
+{
+    /* pump02 status — relay1_state maps to physical relay2 (PB4/PB5) */
+    char payload[48];
+    snprintf(payload, sizeof(payload),
+             "{\"relay1_state\":%d,\"online\":true}",
+             relay2 ? 1 : 0);
+    queue_publish(TOPIC_STATUS2, payload);
+}
+
 static void publish_alert(bool ov, bool uv, bool pl, bool dr)
 {
     char payload[128];
@@ -655,7 +668,25 @@ static void process_line(const char *line)
                 recv_pending_topic[0] = '\0';
                 return;
             }
+            /* pump/02/cmd — relay1 field maps to physical relay2 (PB4/PB5) */
+            bool is_pump2_cmd = strstr(recv_pending_topic, TOPIC_CMD2) != NULL;
             recv_pending_topic[0] = '\0';
+            if (is_pump2_cmd)
+            {
+                int r = extract_int(json, "relay1");
+                if (r >= 0)
+                {
+                    char cmd_src[16] = "";
+                    extract_str(json, "src", cmd_src, sizeof(cmd_src));
+                    bool prev2 = relay2;
+                    Relay2_Set(r == 1);
+                    if (relay2 != prev2) {
+                        log_relay_event(2, relay2, cmd_src[0] ? cmd_src : "manual");
+                        publish_status2();
+                    }
+                }
+                return;
+            }
             /* OTA command: {"url":"https://..."} */
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
@@ -668,7 +699,6 @@ static void process_line(const char *line)
                 return;
             }
             int r1 = extract_int(json, "relay1");
-            int r2 = extract_int(json, "relay2");
             if (r1 >= 0)
             {
                 if (r1 == 1 && HAL_GetTick() < lockout_until)
@@ -683,16 +713,6 @@ static void process_line(const char *line)
                         log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
                     Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
                 }
-            }
-            if (r2 >= 0)
-            {
-                char cmd_src[16] = "";
-                extract_str(json, "src", cmd_src, sizeof(cmd_src));
-                bool prev2 = relay2;
-                Relay2_Set(r2 == 1);
-                if (relay2 != prev2)
-                    log_relay_event(2, relay2, cmd_src[0] ? cmd_src : "manual");
-                Debug_Print(r2 ? "[CMD] Relay2 ON\r\n" : "[CMD] Relay2 OFF\r\n");
             }
             return;
         }
@@ -734,33 +754,40 @@ static void process_line(const char *line)
                 modem_ota_start(ota_url);
                 return;
             }
-            /* Inline payload (single-line format) */
-            int r1 = extract_int(json, "relay1");
-            int r2 = extract_int(json, "relay2");
-            if (r1 >= 0)
+            /* Inline payload — check if pump/02/cmd (relay1→physical relay2) */
+            if (strstr(line, TOPIC_CMD2))
             {
-                if (r1 == 1 && HAL_GetTick() < lockout_until)
-                    Debug_Print("[CMD] Relay1 ON blocked — lockout active\r\n");
-                else
+                int r = extract_int(json, "relay1");
+                if (r >= 0)
                 {
                     char cmd_src[16] = "";
                     extract_str(json, "src", cmd_src, sizeof(cmd_src));
-                    bool prev1 = relay1;
-                    Relay1_Set(r1 == 1);
-                    if (relay1 != prev1)
-                        log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
-                    Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
+                    bool prev2 = relay2;
+                    Relay2_Set(r == 1);
+                    if (relay2 != prev2) {
+                        log_relay_event(2, relay2, cmd_src[0] ? cmd_src : "manual");
+                        publish_status2();
+                    }
                 }
             }
-            if (r2 >= 0)
+            else
             {
-                char cmd_src[16] = "";
-                extract_str(json, "src", cmd_src, sizeof(cmd_src));
-                bool prev2 = relay2;
-                Relay2_Set(r2 == 1);
-                if (relay2 != prev2)
-                    log_relay_event(2, relay2, cmd_src[0] ? cmd_src : "manual");
-                Debug_Print(r2 ? "[CMD] Relay2 ON\r\n" : "[CMD] Relay2 OFF\r\n");
+                int r1 = extract_int(json, "relay1");
+                if (r1 >= 0)
+                {
+                    if (r1 == 1 && HAL_GetTick() < lockout_until)
+                        Debug_Print("[CMD] Relay1 ON blocked — lockout active\r\n");
+                    else
+                    {
+                        char cmd_src[16] = "";
+                        extract_str(json, "src", cmd_src, sizeof(cmd_src));
+                        bool prev1 = relay1;
+                        Relay1_Set(r1 == 1);
+                        if (relay1 != prev1)
+                            log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
+                        Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
+                    }
+                }
             }
         }
         else
@@ -1096,8 +1123,16 @@ static void process_line(const char *line)
         }
         if (strstr(line, "+QMTSUB: 0,3,0"))
         {
-            /* Settings topic subscribed — fully connected now */
-            Debug_Print("[MQTT] Subscribed to " TOPIC_SETTINGS "\r\n");
+            /* Settings topic subscribed — subscribe to pump02 cmd topic */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_SETTINGS " — subscribing pump02...\r\n");
+            char sub_cmd[64];
+            snprintf(sub_cmd, sizeof(sub_cmd), "AT+QMTSUB=0,4,\"%s\",1", TOPIC_CMD2);
+            modem_cmd(sub_cmd);
+        }
+        if (strstr(line, "+QMTSUB: 0,4,0"))
+        {
+            /* pump02/cmd subscribed — fully connected now */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_CMD2 "\r\n");
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
@@ -1118,6 +1153,7 @@ static void process_line(const char *line)
             last_heartbeat_ms = HAL_GetTick();
             modem_cmd("AT+CSQ"); /* seed rssi before first publish */
             publish_status();
+            publish_status2();
         }
         break;
 
@@ -1901,10 +1937,12 @@ void Modem_Process(void)
             (relay1 != prev_relay1 || relay2 != prev_relay2 ||
              dry_run_tripped != prev_dry_run_trip))
         {
+            bool relay2_changed = (relay2 != prev_relay2);
             prev_relay1       = relay1;
             prev_relay2       = relay2;
             prev_dry_run_trip = dry_run_tripped;
             publish_status();
+            if (relay2_changed) publish_status2();
         }
 
         /* heartbeat every 60 s — keeps Firebase online:true fresh */

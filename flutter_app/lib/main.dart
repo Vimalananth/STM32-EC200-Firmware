@@ -12,14 +12,12 @@ class SiteConfig {
   final String id;
   final String name;
   final String meterPumpId; // pump whose status feeds PowerMeterCard
-  final String deviceId;    // device that owns relay1/relay2 (Firebase cmd path)
-  final List<String> pumpIds; // index 0=relay1, 1=relay2 on deviceId
+  final List<String> pumpIds; // each pumpId is its own device (relay1 only)
 
   const SiteConfig({
     required this.id,
     required this.name,
     required this.meterPumpId,
-    required this.deviceId,
     required this.pumpIds,
   });
 }
@@ -29,12 +27,11 @@ const kSites = [
     id: 'site01',
     name: 'Site 1',
     meterPumpId: 'pump01',
-    deviceId: 'pump01',
     pumpIds: ['pump01', 'pump02'],
   ),
   // Add site02 when second hardware is ready:
   // SiteConfig(id:'site02', name:'Site 2', meterPumpId:'pump03',
-  //            deviceId:'pump03', pumpIds:['pump03','pump04']),
+  //            pumpIds:['pump03','pump04']),
 ];
 
 void main() async {
@@ -85,12 +82,10 @@ class _PumpDashboardState extends State<PumpDashboard> {
   @override
   void initState() {
     super.initState();
-    // Listen to each pump's relay state via its site's device
+    // Listen to each pump's own relay1_state — each pump is its own device
     for (final site in kSites) {
-      for (var i = 0; i < site.pumpIds.length; i++) {
-        final pumpId = site.pumpIds[i];
-        final relayField = 'relay${i + 1}_state';
-        db.ref('pumps/${site.deviceId}/status/$relayField').onValue.listen((event) {
+      for (final pumpId in site.pumpIds) {
+        db.ref('pumps/$pumpId/status/relay1_state').onValue.listen((event) {
           if (mounted) setState(() => _pumpOn[pumpId] = (event.snapshot.value ?? 0) == 1);
         });
       }
@@ -98,10 +93,9 @@ class _PumpDashboardState extends State<PumpDashboard> {
   }
 
   Future<void> _handlePumpToggle(String pumpId, bool turnOn) async {
-    final site = kSites.firstWhere((s) => s.pumpIds.contains(pumpId));
-    final relayIndex = site.pumpIds.indexOf(pumpId) + 1;
-    await db.ref('pumps/${site.deviceId}/cmd').set({
-      'relay$relayIndex': turnOn ? 1 : 0,
+    // Each pump is its own device — always relay1
+    await db.ref('pumps/$pumpId/cmd').set({
+      'relay1': turnOn ? 1 : 0,
       'ts': DateTime.now().millisecondsSinceEpoch,
     });
   }
@@ -182,8 +176,8 @@ class _SiteSection extends StatelessWidget {
           PumpCard(
             pumpId: site.pumpIds[i],
             pumpName: 'Pump ${i + 1}',
-            deviceId: site.deviceId,
-            relayNum: i + 1,
+            deviceId: site.pumpIds[i],
+            relayNum: 1,
             otherPumpOn: site.pumpIds
                 .where((p) => p != site.pumpIds[i])
                 .any((p) => pumpOn[p] == true),
