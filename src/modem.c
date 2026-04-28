@@ -668,8 +668,11 @@ static void process_line(const char *line)
                 recv_pending_topic[0] = '\0';
                 return;
             }
-            /* pump/02/cmd — relay1 field maps to physical relay2 (PB4/PB5) */
-            bool is_pump2_cmd = strstr(recv_pending_topic, TOPIC_CMD2) != NULL;
+            /* pump/02/cmd — relay1 field maps to physical relay2 (PB4/PB5)
+             * Check BOTH recv_pending_topic (split-line) AND current line
+             * (inline: topic+payload on same AT+QMTRECV response line) */
+            bool is_pump2_cmd = strstr(recv_pending_topic, TOPIC_CMD2) != NULL ||
+                                 strstr(line, TOPIC_CMD2) != NULL;
             recv_pending_topic[0] = '\0';
             if (is_pump2_cmd)
             {
