@@ -136,7 +136,7 @@ int main(void)
   g_boot_phase = 4;
   WDG_KICK();
 
-  MX_USART2_UART_Init();  /* Modbus RS485 at 9600 baud — needed for Debug_Print */
+  MX_USART2_UART_Init();  /* Modbus RS485 at 9600 baud */
   g_boot_phase = 5;
   WDG_KICK();
 
@@ -164,7 +164,7 @@ int main(void)
   g_boot_phase = 8;
 
   /* Initialize Modbus RS485 master (USART2, PA8=DE/RE) */
-  // Modbus_Init(&huart2); // Temporarily disabled for debug on USART2
+  Modbus_Init(&huart2);
 
   /* Initialize modem attached to USART1 (PB6=TX, PB7=RX) */
   Modem_Init(&huart1);
@@ -186,11 +186,9 @@ int main(void)
     g_boot_phase = 11;
     Modem_Process();
     /* LoRa_Process(); */  /* LoRa disabled */
-    /* Temporary PA8 blink validation mode:
-       keep RS485 driver control untouched by Modbus code so heartbeat owns PA8. */
-    /* if (!OTA_IsActive()) {
+    if (!OTA_IsActive()) {
       Modbus_Process();
-    } */
+    }
     OTA_Process();
     /* Diagnostic heartbeat: toggle PA8 (DE485) every 500ms to confirm MCU alive. */
     if ((HAL_GetTick() - g_hb_last_ms) >= 500U) {
@@ -375,12 +373,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = Relay1_RST_Pin;
   HAL_GPIO_Init(Relay1_RST_GPIO_Port, &GPIO_InitStruct);
 
-  /* PB4 — pump2 SET coil (transistor driver), idle LOW */
+  /* PB5 — pump2 SET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_Pin_Pin;
   HAL_GPIO_Init(Relay2_Pin_GPIO_Port, &GPIO_InitStruct);
 
-  /* PB5 — pump2 RESET coil (transistor driver), idle LOW */
+  /* PB4 — pump2 RESET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_RST_Pin;
   HAL_GPIO_Init(Relay2_RST_GPIO_Port, &GPIO_InitStruct);
