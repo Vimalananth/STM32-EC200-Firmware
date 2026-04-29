@@ -66,15 +66,15 @@ void Debug_Print(const char *msg);  /* send string to USART2 serial monitor */
  * PA1 → transistor → Pump1 SET  coil (pulse HIGH 200ms → relay latches ON)
  * PB3 → transistor → Pump1 RESET coil (pulse HIGH 200ms → relay latches OFF)
  * PB5 → transistor → Pump2 SET  coil (pulse HIGH 200ms → relay latches ON)
- * PB8 → transistor → Pump2 RESET coil (pulse HIGH 200ms → relay latches OFF)
- * (PB4 unusable; PB8 free since LoRa disabled) */
+ * PB0 → transistor → Pump2 RESET coil (pulse HIGH 200ms → relay latches OFF)
+ * (PB4 unusable; PB0 free; PB8/PB9 reserved for future LoRa) */
 #define Relay_Pin_Pin        GPIO_PIN_1   /* Pump 1 SET   coil (PA1) */
 #define Relay_Pin_GPIO_Port  GPIOA
 #define Relay1_RST_Pin       GPIO_PIN_3   /* Pump 1 RESET coil (PB3) */
 #define Relay1_RST_GPIO_Port GPIOB
 #define Relay2_Pin_Pin       GPIO_PIN_5   /* Pump 2 SET   coil (PB5) */
 #define Relay2_Pin_GPIO_Port GPIOB
-#define Relay2_RST_Pin       GPIO_PIN_8   /* Pump 2 RESET coil (PB8, LoRa TX freed) */
+#define Relay2_RST_Pin       GPIO_PIN_0   /* Pump 2 RESET coil (PB0) */
 #define Relay2_RST_GPIO_Port GPIOB
 #define DE485_Pin_Pin        GPIO_PIN_8   /* RS485 DE/RE direction control */
 #define DE485_Pin_GPIO_Port  GPIOA
