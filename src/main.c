@@ -378,7 +378,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = Relay2_Pin_Pin;
   HAL_GPIO_Init(Relay2_Pin_GPIO_Port, &GPIO_InitStruct);
 
-  /* PB4 — pump2 RESET coil (transistor driver), idle LOW */
+  /* PB8 — pump2 RESET coil (transistor driver), idle LOW — LoRa TX freed */
   HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_RST_Pin;
   HAL_GPIO_Init(Relay2_RST_GPIO_Port, &GPIO_InitStruct);
