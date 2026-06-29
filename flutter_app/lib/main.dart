@@ -278,30 +278,40 @@ class _SiteSection extends StatelessWidget {
                   ?.copyWith(fontWeight: FontWeight.bold),
             ),
           ),
-        PowerMeterCard(pumpId: site.meterPumpId),
-        const SizedBox(height: 16),
-        for (var i = 0; i < site.pumpIds.length; i++) ...[
-          PumpCard(
-            pumpId: site.pumpIds[i],
-            pumpName: 'Pump ${i + 1}',
-            deviceId: site.deviceId,   // physical device — status lives at pumps/{deviceId}/status
-            relayNum: i + 1,           // relay1 for pump[0], relay2 for pump[1]
-            otherPumpOn: site.pumpIds
-                .where((p) => p != site.pumpIds[i])
-                .any((p) => pumpOn[p] == true),
-            otherPumpName: 'Pump ${i == 0 ? 2 : 1}',
-            onPumpToggle: (val) => onPumpToggle(site.pumpIds[i], val),
-          ),
-          const SizedBox(height: 16),
-        ],
-        RotationScheduleCard(
-          siteId: site.id,
-          pump1Id: site.pumpIds[0],
-          pump2Id: site.pumpIds[1],
-        ),
         if (site.hasSlave) ...[
+          // Slave device: energy meter (SELEC EM4M via LoRa) then pump control
+          SlaveEnergyCard(deviceId: site.deviceId),
           const SizedBox(height: 16),
-          FlowMeterCard(deviceId: site.deviceId),
+          PumpCard(
+            pumpId: site.pumpIds[0],
+            pumpName: 'Pump 1',
+            deviceId: site.deviceId,
+            relayNum: 1,
+            otherPumpOn: false,
+            otherPumpName: '',
+            onPumpToggle: (val) => onPumpToggle(site.pumpIds[0], val),
+          ),
+        ] else ...[
+          PowerMeterCard(pumpId: site.meterPumpId),
+          const SizedBox(height: 16),
+          for (var i = 0; i < site.pumpIds.length; i++) ...[
+            PumpCard(
+              pumpId: site.pumpIds[i],
+              pumpName: 'Pump ${i + 1}',
+              deviceId: site.deviceId,
+              relayNum: i + 1,
+              otherPumpOn: site.pumpIds
+                  .where((p) => p != site.pumpIds[i])
+                  .any((p) => pumpOn[p] == true),
+              otherPumpName: 'Pump ${i == 0 ? 2 : 1}',
+              onPumpToggle: (val) => onPumpToggle(site.pumpIds[i], val),
+            ),
+            const SizedBox(height: 16),
+          ],
+          RotationScheduleCard(
+            deviceId: site.deviceId,
+            pump1Id:  site.pumpIds[0],
+          ),
         ],
       ],
     );
@@ -309,16 +319,18 @@ class _SiteSection extends StatelessWidget {
 }
 
 // ─── Rotation schedule card ───────────────────────────────────────────────────
+// Settings (rot_en, rot_min) are saved to pumps/{pump1Id}/settings and forwarded
+// via bridge → MQTT to the firmware.  The firmware runs the rotation timer and
+// publishes rot_active + rot_remain_s in status.  This card is display-only for
+// the running state — no cloud-side timer logic.
 class RotationScheduleCard extends StatefulWidget {
-  final String siteId;
-  final String pump1Id;
-  final String pump2Id;
+  final String deviceId; // physical STM32 device (reads status from here)
+  final String pump1Id;  // settings written to pumps/{pump1Id}/settings
 
   const RotationScheduleCard({
     super.key,
-    required this.siteId,
+    required this.deviceId,
     required this.pump1Id,
-    required this.pump2Id,
   });
   @override
   State<RotationScheduleCard> createState() => _RotationScheduleCardState();
@@ -327,72 +339,77 @@ class RotationScheduleCard extends StatefulWidget {
 class _RotationScheduleCardState extends State<RotationScheduleCard> {
   final db = FirebaseDatabase.instance;
 
-  bool   _enabled         = false;
-  int    _intervalMinutes = 240; // default 4 h
-  late String _currentPump;
-  int    _startedAt       = 0;
-  bool   _expanded        = false;
-  Timer? _ticker;
+  bool _enabled         = false;
+  int  _intervalMinutes = 240; // default 4 h
+  bool _expanded        = false;
+
+  // Live state from device status
+  int  _rotActive   = 0; // 0=off, 1=pump1 running, 2=pump2 running
+  int  _rotRemainS  = 0; // seconds remaining on current relay
+
+  StreamSubscription<DatabaseEvent>? _settingsSub;
+  StreamSubscription<DatabaseEvent>? _statusSub;
 
   static const _options = [
-    (label: '30 min',  minutes: 30),
-    (label: '1 hour',  minutes: 60),
-    (label: '2 hours', minutes: 120),
-    (label: '3 hours', minutes: 180),
-    (label: '4 hours', minutes: 240),
-    (label: '6 hours', minutes: 360),
-    (label: '8 hours', minutes: 480),
-    (label: '12 hours',minutes: 720),
+    (label: '30 min',   minutes: 30),
+    (label: '1 hour',   minutes: 60),
+    (label: '2 hours',  minutes: 120),
+    (label: '3 hours',  minutes: 180),
+    (label: '4 hours',  minutes: 240),
+    (label: '6 hours',  minutes: 360),
+    (label: '8 hours',  minutes: 480),
+    (label: '12 hours', minutes: 720),
   ];
 
   @override
   void initState() {
     super.initState();
-    _currentPump = widget.pump1Id;
-    db.ref('sites/${widget.siteId}/rotation_schedule').onValue.listen((event) {
+    // Read saved settings (cfg_rot_en / cfg_rot_min mirrored back in status)
+    _settingsSub = db.ref('pumps/${widget.pump1Id}/settings').onValue.listen((event) {
       final data = event.snapshot.value;
       if (data != null && mounted) {
         final s = Map<String, dynamic>.from(data as Map);
         setState(() {
-          _enabled         = s['enabled']          ?? false;
-          _intervalMinutes = (s['interval_minutes'] ?? 240) as int;
-          _currentPump     = s['current_pump']      ?? widget.pump1Id;
-          _startedAt       = (s['started_at']       ?? 0) as int;
+          _enabled         = ((s['rot_en'] ?? 0) as num).toInt() != 0;
+          _intervalMinutes = ((s['rot_min'] ?? 240) as num).toInt();
+          if (!_options.any((o) => o.minutes == _intervalMinutes)) {
+            _intervalMinutes = 240;
+          }
         });
       }
     });
-    // Refresh remaining time display every minute
-    _ticker = Timer.periodic(const Duration(minutes: 1), (_) {
-      if (mounted) setState(() {});
+    // Live rotation state from device status
+    _statusSub = db.ref('pumps/${widget.deviceId}/status').onValue.listen((event) {
+      final data = event.snapshot.value;
+      if (data != null && mounted) {
+        final s = Map<String, dynamic>.from(data as Map);
+        setState(() {
+          _rotActive  = ((s['rot_active']   ?? 0) as num).toInt();
+          _rotRemainS = ((s['rot_remain_s'] ?? 0) as num).toInt();
+        });
+      }
     });
   }
 
   @override
   void dispose() {
-    _ticker?.cancel();
+    _settingsSub?.cancel();
+    _statusSub?.cancel();
     super.dispose();
   }
 
   String _timeRemaining() {
-    if (!_enabled || _startedAt == 0) return '';
-    final elapsedMs  = DateTime.now().millisecondsSinceEpoch - _startedAt;
-    final intervalMs = _intervalMinutes * 60 * 1000;
-    final remainMs   = intervalMs - elapsedMs;
-    if (remainMs <= 0) return 'Switching soon...';
-    final h = remainMs ~/ 3600000;
-    final m = (remainMs % 3600000) ~/ 60000;
+    if (!_enabled || _rotActive == 0 || _rotRemainS <= 0) return '';
+    final h = _rotRemainS ~/ 3600;
+    final m = (_rotRemainS % 3600) ~/ 60;
     return h > 0 ? '${h}h ${m}m remaining' : '${m}m remaining';
   }
 
   Future<void> _save() async {
-    await db.ref('sites/${widget.siteId}/rotation_schedule').update({
-      'enabled':          _enabled,
-      'interval_minutes': _intervalMinutes,
+    await db.ref('pumps/${widget.pump1Id}/settings').update({
+      'rot_en':  _enabled ? 1 : 0,
+      'rot_min': _intervalMinutes,
     });
-    if (!_enabled) {
-      // clear started_at so it restarts cleanly when re-enabled
-      await db.ref('sites/${widget.siteId}/rotation_schedule/started_at').set(0);
-    }
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Rotation schedule saved'),
@@ -402,7 +419,7 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
 
   @override
   Widget build(BuildContext context) {
-    final activePumpLabel = _currentPump == widget.pump1Id ? 'Pump 1' : 'Pump 2';
+    final activePumpLabel = _rotActive == 1 ? 'Pump 1' : (_rotActive == 2 ? 'Pump 2' : '');
     final remaining       = _timeRemaining();
 
     return Card(
@@ -427,7 +444,7 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
                           fontWeight: FontWeight.bold,
                           color: Colors.teal)),
                   const Spacer(),
-                  if (_enabled) ...[
+                  if (_enabled && activePumpLabel.isNotEmpty) ...[
                     Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 8, vertical: 2),
@@ -1204,6 +1221,163 @@ class _FlowMeterCardState extends State<FlowMeterCard> {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ─── Slave Energy Meter card ──────────────────────────────────────────────────
+// Reads slave_log, displays SELEC EM4M values (v1/v2/v3, i1/i2/i3, kw)
+// received from the Blue Pill slave via LoRa.
+class SlaveEnergyCard extends StatefulWidget {
+  final String deviceId;
+  const SlaveEnergyCard({super.key, required this.deviceId});
+  @override
+  State<SlaveEnergyCard> createState() => _SlaveEnergyCardState();
+}
+
+class _SlaveEnergyCardState extends State<SlaveEnergyCard> {
+  final db = FirebaseDatabase.instance;
+  Map<String, dynamic> _log = {};
+  StreamSubscription<DatabaseEvent>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = db
+        .ref('pumps/${widget.deviceId}/slave_log')
+        .limitToLast(1)
+        .onChildAdded
+        .listen((event) {
+      final data = event.snapshot.value;
+      if (data != null && mounted) {
+        setState(() => _log = Map<String, dynamic>.from(data as Map));
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_log.isEmpty || !_log.containsKey('v1')) {
+      return Card(
+        elevation: 2,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: const Padding(
+          padding: EdgeInsets.all(16),
+          child: Row(children: [
+            Icon(Icons.electric_meter, color: Colors.orange),
+            SizedBox(width: 8),
+            Text('Energy Meter',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            Spacer(),
+            Text('No data', style: TextStyle(color: Colors.grey)),
+          ]),
+        ),
+      );
+    }
+
+    final double v1  = ((_log['v1']   ?? 0) as num).toDouble();
+    final double v2  = ((_log['v2']   ?? 0) as num).toDouble();
+    final double v3  = ((_log['v3']   ?? 0) as num).toDouble();
+    final double i1  = ((_log['i1']   ?? 0) as num).toDouble();
+    final double i2  = ((_log['i2']   ?? 0) as num).toDouble();
+    final double i3  = ((_log['i3']   ?? 0) as num).toDouble();
+    final double kw  = ((_log['kw']   ?? 0) as num).toDouble();
+    final int   rssi = ((_log['rssi'] ?? 0) as num).toInt();
+    final int   ageS = ((_log['age_s'] ?? 0) as num).toInt();
+
+    final bool stale = ageS > 120;
+    final Color rssiColor = rssi < -95 ? Colors.red
+                          : rssi < -85 ? Colors.orange
+                          : Colors.green;
+
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              const Icon(Icons.electric_meter, color: Colors.orange),
+              const SizedBox(width: 8),
+              const Text('Energy Meter',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              Icon(Icons.router, color: rssiColor, size: 16),
+              const SizedBox(width: 4),
+              Text('$rssi dBm',
+                  style: TextStyle(fontSize: 11, color: rssiColor)),
+              const SizedBox(width: 10),
+              Icon(stale ? Icons.warning_amber : Icons.check_circle,
+                  color: stale ? Colors.orange : Colors.green, size: 14),
+              const SizedBox(width: 4),
+              Text('${ageS}s ago',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: stale ? Colors.orange : Colors.grey)),
+            ]),
+            const Divider(),
+            const SizedBox(height: 4),
+            // Voltage row
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _EnergyChip(label: 'V1', value: '${v1.toStringAsFixed(1)} V', color: Colors.blue),
+                _EnergyChip(label: 'V2', value: '${v2.toStringAsFixed(1)} V', color: Colors.blue),
+                _EnergyChip(label: 'V3', value: '${v3.toStringAsFixed(1)} V', color: Colors.blue),
+              ],
+            ),
+            const SizedBox(height: 8),
+            // Current row
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _EnergyChip(label: 'I1', value: '${i1.toStringAsFixed(2)} A', color: Colors.teal),
+                _EnergyChip(label: 'I2', value: '${i2.toStringAsFixed(2)} A', color: Colors.teal),
+                _EnergyChip(label: 'I3', value: '${i3.toStringAsFixed(2)} A', color: Colors.teal),
+              ],
+            ),
+            const SizedBox(height: 8),
+            // Power row
+            Center(
+              child: _EnergyChip(
+                  label: 'Active Power',
+                  value: '${kw.toStringAsFixed(1)} kW',
+                  color: Colors.orange),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EnergyChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color color;
+  const _EnergyChip(
+      {required this.label, required this.value, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(label,
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+        const SizedBox(height: 2),
+        Text(value,
+            style: TextStyle(
+                fontSize: 14, fontWeight: FontWeight.bold, color: color)),
+      ],
     );
   }
 }

@@ -49,6 +49,20 @@ static int      lora_last_rssi     = 0;
 static int      lora_last_snr      = 0;
 static uint32_t lora_last_rcv_tick = 0; /* HAL_GetTick() of last +RCV */
 
+/* init diagnostics — count +ERR responses during LoRa_Init AT commands */
+static int lora_init_errs = 0;
+
+/* energy meter — populated from slave Modbus when V1: field present */
+static bool    lora_energy_valid = false;
+static int32_t lora_v1x10  = 0;   /* V × 10  */
+static int32_t lora_v2x10  = 0;
+static int32_t lora_v3x10  = 0;
+static int32_t lora_i1x100 = 0;   /* A × 100 */
+static int32_t lora_i2x100 = 0;
+static int32_t lora_i3x100 = 0;
+static int32_t lora_kwx10  = 0;   /* kW × 10 */
+static int32_t lora_kwh    = 0;   /* Import kWh (integer) */
+
 /* ─── helpers ───────────────────────────────────────────────────────────── */
 
 static void lora_send_cmd(const char *cmd)
@@ -80,6 +94,9 @@ static void lora_poll(uint32_t timeout_ms)
             lora_line[lora_pos] = '\0';
             if (lora_pos > 0)
             {
+                /* count +ERR responses to track init health (visible in MQTT slave_log) */
+                if (strncmp(lora_line, "+ERR", 4) == 0)
+                    lora_init_errs++;
                 char dbg[LORA_LINE_MAX + 16];
                 snprintf(dbg, sizeof(dbg), "[LoRa] %s\r\n", lora_line);
                 Debug_Print(dbg);
@@ -159,6 +176,20 @@ static void lora_process_rcv(const char *line)
                 lora_tv_cumulative += new_tv;                  /* slave rebooted */
             lora_tv_prev          = new_tv;
             lora_total_litres_int = new_tv;
+        }
+
+        /* Parse energy fields — present only when slave has SELEC EM4M */
+        {
+            const char *ep;
+            ep = strstr(data, "V1:");  if (ep) lora_v1x10  = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "V2:");  if (ep) lora_v2x10  = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "V3:");  if (ep) lora_v3x10  = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "I1:");  if (ep) lora_i1x100 = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "I2:");  if (ep) lora_i2x100 = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "I3:");  if (ep) lora_i3x100 = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "KW:");  if (ep) lora_kwx10  = (int32_t)strtol(ep + 3, NULL, 10);
+            ep = strstr(data, "KWH:"); if (ep) lora_kwh    = (int32_t)strtol(ep + 4, NULL, 10);
+            lora_energy_valid = (strstr(data, "V1:") != NULL);
         }
 
         if (!OTA_IsActive()) {
@@ -302,3 +333,14 @@ uint32_t LoRa_GetLastRcvAge(void)
     if (lora_last_rcv_tick == 0) return 0xFFFFFFFFUL;
     return HAL_GetTick() - lora_last_rcv_tick;
 }
+int LoRa_GetInitErrs(void)       { return lora_init_errs; }
+/* Energy meter getters — valid only when LoRa_EnergyValid() == true */
+bool    LoRa_EnergyValid(void)   { return lora_energy_valid; }
+int32_t LoRa_GetV1x10(void)     { return lora_v1x10;  }
+int32_t LoRa_GetV2x10(void)     { return lora_v2x10;  }
+int32_t LoRa_GetV3x10(void)     { return lora_v3x10;  }
+int32_t LoRa_GetI1x100(void)    { return lora_i1x100; }
+int32_t LoRa_GetI2x100(void)    { return lora_i2x100; }
+int32_t LoRa_GetI3x100(void)    { return lora_i3x100; }
+int32_t LoRa_GetKWx10(void)     { return lora_kwx10;  }
+int32_t LoRa_GetKWh(void)       { return lora_kwh;    }

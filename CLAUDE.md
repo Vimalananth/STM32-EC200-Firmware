@@ -1,5 +1,18 @@
 # Pump Controller — Project Rules & Architecture
 
+## IMPORTANT — AI Assistant Rules
+
+1. **Do NOT make any code changes without explicit user approval.**
+   Always explain what you plan to change and why, then wait for the user to say yes
+   before editing any file. This includes platformio.ini, source files, headers,
+   scripts, and any other project file.
+
+2. **Do NOT change build flags without understanding hardware consequences.**
+   Removing or adding flags like `-DFW_MIN_LOGS` can have side effects that are not
+   obvious from the code alone (e.g., feedback loops through shared UART pins).
+
+---
+
 ## System Overview
 
 Remote pump controller using STM32G0 (master) + Quectel EC200U modem for cloud connectivity,
@@ -13,6 +26,10 @@ and STM32F103 Blue Pill (slave) for relay control + flow meter via LoRa.
 - MCU: STM32G070KBT6
 - Modem: Quectel EC200U (MQTT over LTE)
 - LoRa: RYLR998 on USART3 (PB8=TX, PB9=RX) — address 1
+- **CRITICAL: PB8 is shared between USART3 TX (→ RYLR998 RX) and Debug_Print output.
+  NEVER remove `-DFW_MIN_LOGS` from platformio.ini. If Debug_Print is enabled, every
+  log line feeds back into the RYLR998 RX as garbage AT commands, permanently scrambling
+  the module until AT+RESET clears it. FW_MIN_LOGS must always be ON on master.**
 - Project: `c:\Users\admin\Documents\PlatformIO\Projects\STM32_EC200`
 - Linker: `STM32G070KBTX_APP.ld`
 - Uses `--specs=nano.specs` → **NO float printf**, use integer arithmetic only

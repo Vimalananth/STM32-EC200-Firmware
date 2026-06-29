@@ -91,6 +91,9 @@ static int   cfg_dry_t2  = 8;    /* s  — dry run delay for relay2          */
 static int   cfg_dry_en2 = 1;    /* 1=dry-run enabled for relay2            */
 static int   cfg_hp2     = 0;    /* relay2 pump rating                       */
 static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
+/* ── Rotation schedule settings */
+static int   cfg_rot_en  = 0;   /* 1=rotation enabled, 0=disabled          */
+static int   cfg_rot_min = 60;  /* minutes per relay before switching       */
 #define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
 /* Minimum current to consider the motor actually running.
  * If i < this threshold the motor is completely de-energised (external
@@ -178,9 +181,13 @@ static uint8_t  dry_run_count2  = 0;
 static bool     dry_run_tripped2 = false;
 static uint32_t lockout_until2  = 0;
 
+/* ── Rotation schedule state */
+static int      rot_active    = 0;  /* 0=off, 1=relay1 active, 2=relay2 active */
+static uint32_t rot_elapsed_s = 0;  /* seconds elapsed on current relay        */
+
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[512];
+static char pub_payload[800]; /* must be >= largest payload built in publish_status() */
 static bool pub_pending = false;
 /* Exact byte count sent in the last AT+QMTPUBEX command.
  * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
@@ -587,7 +594,13 @@ static void publish_status(void)
     int r3 = LoRa_GetRelay3State();  /* -1=unknown, 0=OFF, 1=ON */
     int r4 = LoRa_GetRelay4State();
 
-    char payload[720];
+    uint32_t rot_remain = 0;
+    if (rot_active) {
+        uint32_t interval_s = (uint32_t)cfg_rot_min * 60U;
+        rot_remain = (rot_elapsed_s < interval_s) ? interval_s - rot_elapsed_s : 0U;
+    }
+
+    char payload[800];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
@@ -600,7 +613,9 @@ static void publish_status(void)
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
-             "\"cfg_uv_rst_t\":%d}",
+             "\"cfg_uv_rst_t\":%d,"
+             "\"cfg_rot_en\":%d,\"cfg_rot_min\":%d,"
+             "\"rot_active\":%d,\"rot_remain_s\":%lu}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
@@ -617,7 +632,9 @@ static void publish_status(void)
              scfg_ov, scfg_uv, scfg_pl,
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
-             cfg_uv_restart_t);
+             cfg_uv_restart_t,
+             cfg_rot_en, cfg_rot_min,
+             rot_active, (unsigned long)rot_remain);
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -971,6 +988,70 @@ static void run_protection(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Rotation schedule — called every 1 s alongside run_protection()
+ * Alternates relay1 → relay2 → relay1 every cfg_rot_min minutes.
+ * Timer only advances while the active relay is physically ON.
+ * Manual MQTT relay commands are blocked while rotation is active.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void run_rotation(void)
+{
+    if (!cfg_rot_en) {
+        if (rot_active != 0) {
+            rot_active    = 0;
+            rot_elapsed_s = 0;
+            publish_status();
+        }
+        return;
+    }
+
+    uint32_t interval_s = (uint32_t)cfg_rot_min * 60U;
+
+    /* First call after enabling — claim whichever relay is already ON, else start relay1 */
+    if (rot_active == 0) {
+        if (relay2 && !relay1) {
+            rot_active = 2;
+        } else {
+            if (!relay1) {
+                Relay1_Set(true);
+                relay1_on_tick = HAL_GetTick();
+                log_relay_event(1, true, "rotation");
+            }
+            rot_active = 1;
+        }
+        rot_elapsed_s = 0;
+        publish_status();
+        return;
+    }
+
+    /* Pause timer if active relay is OFF (protection trip or external off) */
+    bool active_on = (rot_active == 1) ? relay1 : relay2;
+    if (!active_on) return;
+
+    rot_elapsed_s++;
+    if (rot_elapsed_s < interval_s) return;
+
+    /* Interval expired — switch relay */
+    rot_elapsed_s = 0;
+    if (rot_active == 1) {
+        Relay1_Set(false);
+        log_relay_event(1, false, "rotation");
+        Relay2_Set(true);
+        relay2_on_tick = HAL_GetTick();
+        log_relay_event(2, true, "rotation");
+        rot_active = 2;
+    } else {
+        Relay2_Set(false);
+        log_relay_event(2, false, "rotation");
+        Relay1_Set(true);
+        relay1_on_tick = HAL_GetTick();
+        log_relay_event(1, true, "rotation");
+        rot_active = 1;
+    }
+    publish_status();
+    pub_status2_needed = true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * JSON field extractor  — extracts integer value for a key
  * e.g. extract_int("{\"relay1\":1,\"relay2\":0}", "relay1") → 1
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1165,6 +1246,9 @@ static void apply_settings(const char *json)
     if (strstr(json, "\"dry_en\":"))             cfg_dry_en = extract_int(json, "dry_en") ? 1 : 0;
     t = extract_int(json, "start_t");            if (t > 0)    cfg_start_t = t;
     if (strstr(json, "\"uv_rst\":"))            { t = extract_int(json, "uv_rst"); if (t >= 0) cfg_uv_restart_t = t; }
+    if (strstr(json, "\"rot_en\":"))            cfg_rot_en  = extract_int(json, "rot_en")  ? 1 : 0;
+    t = extract_int(json, "rot_min");           if (t > 0)    cfg_rot_min = t;
+    if (!cfg_rot_en && rot_active != 0) { rot_active = 0; rot_elapsed_s = 0; }
     Debug_Print("[CFG] Settings updated\r\n");
     publish_status(); /* reflect new cfg_ values immediately — don't wait for next heartbeat */
 }
@@ -1498,6 +1582,10 @@ static void process_line(const char *line)
                 int r = extract_int(json, "relay1");
                 if (r >= 0)
                 {
+                    if (cfg_rot_en) {
+                        Debug_Print("[CMD] Relay2 blocked — rotation active\r\n");
+                        return;
+                    }
                     char cmd_src[16] = "";
                     extract_str(json, "src", cmd_src, sizeof(cmd_src));
                     if (r == 1 && relay1) {
@@ -1549,7 +1637,9 @@ static void process_line(const char *line)
             int r1 = extract_int(json, "relay1");
             if (r1 >= 0)
             {
-                if (r1 == 1 && relay2)
+                if (cfg_rot_en)
+                    Debug_Print("[CMD] Relay1 blocked — rotation active\r\n");
+                else if (r1 == 1 && relay2)
                     Debug_Print("[CMD] Relay1 ON blocked — relay2 active\r\n");
                 else if (r1 == 1 && HAL_GetTick() < lockout_until)
                     Debug_Print("[CMD] Relay1 ON blocked — lockout active\r\n");
@@ -1644,6 +1734,10 @@ static void process_line(const char *line)
                 int r = extract_int(json, "relay1");
                 if (r >= 0)
                 {
+                    if (cfg_rot_en) {
+                        Debug_Print("[CMD] Relay2 blocked — rotation active\r\n");
+                        return;
+                    }
                     char cmd_src[16] = "";
                     extract_str(json, "src", cmd_src, sizeof(cmd_src));
                     if (r == 1 && relay1) {
@@ -1671,7 +1765,9 @@ static void process_line(const char *line)
                 int r1 = extract_int(json, "relay1");
                 if (r1 >= 0)
                 {
-                    if (r1 == 1 && relay2)
+                    if (cfg_rot_en)
+                        Debug_Print("[CMD] Relay1 blocked — rotation active\r\n");
+                    else if (r1 == 1 && relay2)
                         Debug_Print("[CMD] Relay1 ON blocked — relay2 active\r\n");
                     else if (r1 == 1 && HAL_GetTick() < lockout_until)
                         Debug_Print("[CMD] Relay1 ON blocked — lockout active\r\n");
@@ -3134,12 +3230,22 @@ void Modem_Process(void)
             uint32_t fl_x10  = LoRa_GetFlowLpmX10();
             uint32_t tv_l    = LoRa_GetTotalLitresInt();
             uint32_t tv_tot  = LoRa_GetTvCumulative();
-            char lora_log[192];
+            int32_t  sl_v1   = LoRa_GetV1x10();
+            int32_t  sl_v2   = LoRa_GetV2x10();
+            int32_t  sl_v3   = LoRa_GetV3x10();
+            int32_t  sl_i1   = LoRa_GetI1x100();
+            int32_t  sl_i2   = LoRa_GetI2x100();
+            int32_t  sl_i3   = LoRa_GetI3x100();
+            int32_t  sl_kw   = LoRa_GetKWx10();
+            int32_t  sl_kwh  = LoRa_GetKWh();
+            char lora_log[320];
+            int  llen;
             if (ts)
-                snprintf(lora_log, sizeof(lora_log),
+                llen = snprintf(lora_log, sizeof(lora_log),
                          "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
                          "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
-                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu,\"ts\":%llu}",
+                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu,"
+                         "\"lora_init_errs\":%d,\"ts\":%llu",
                          LoRa_GetRelay3State(), LoRa_GetRelay4State(),
                          LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
                          (unsigned long)age_s,
@@ -3147,28 +3253,49 @@ void Modem_Process(void)
                          (unsigned long)(fl_x10 % 10U),
                          (unsigned long)tv_l,
                          (unsigned long)tv_tot,
+                         LoRa_GetInitErrs(),
                          (unsigned long long)ts);
             else
-                snprintf(lora_log, sizeof(lora_log),
+                llen = snprintf(lora_log, sizeof(lora_log),
                          "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
                          "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
-                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu}",
+                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu,"
+                         "\"lora_init_errs\":%d",
                          LoRa_GetRelay3State(), LoRa_GetRelay4State(),
                          LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
                          (unsigned long)age_s,
                          (unsigned long)(fl_x10 / 10U),
                          (unsigned long)(fl_x10 % 10U),
                          (unsigned long)tv_l,
-                         (unsigned long)tv_tot);
+                         (unsigned long)tv_tot,
+                         LoRa_GetInitErrs());
+            if (LoRa_EnergyValid() && llen > 0 && llen < (int)sizeof(lora_log) - 120)
+                llen += snprintf(lora_log + llen, sizeof(lora_log) - (size_t)llen,
+                         ",\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
+                         ",\"i1\":%ld.%02ld,\"i2\":%ld.%02ld,\"i3\":%ld.%02ld"
+                         ",\"kw\":%ld.%ld,\"kwh\":%ld",
+                         (long)(sl_v1/10L),  (long)(sl_v1%10L),
+                         (long)(sl_v2/10L),  (long)(sl_v2%10L),
+                         (long)(sl_v3/10L),  (long)(sl_v3%10L),
+                         (long)(sl_i1/100L), (long)(sl_i1%100L),
+                         (long)(sl_i2/100L), (long)(sl_i2%100L),
+                         (long)(sl_i3/100L), (long)(sl_i3%100L),
+                         (long)(sl_kw/10L),  (long)(sl_kw%10L),
+                         (long)sl_kwh);
+            if (llen > 0 && llen < (int)sizeof(lora_log) - 1) {
+                lora_log[llen++] = '}';
+                lora_log[llen]   = '\0';
+            }
             queue_publish(TOPIC_SLAVE_LOG, lora_log);
         }
 
-        /* run protection every 1 s */
+        /* run protection + rotation every 1 s */
         static uint32_t last_prot_ms = 0;
         if (HAL_GetTick() - last_prot_ms >= 1000)
         {
             last_prot_ms = HAL_GetTick();
             run_protection();
+            run_rotation();
         }
     }
 
