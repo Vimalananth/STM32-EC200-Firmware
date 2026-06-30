@@ -45,18 +45,4 @@ uint32_t LoRa_GetTvCumulative(void);   /* true cumulative litres — survives sl
 /* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
 uint32_t LoRa_GetLastRcvAge(void);
 
-/* Number of +ERR responses during LoRa_Init (0 = all AT commands succeeded) */
-int LoRa_GetInitErrs(void);
-
-/* Energy meter from slave Modbus — valid only when LoRa_EnergyValid() == true */
-bool    LoRa_EnergyValid(void);
-int32_t LoRa_GetV1x10(void);    /* Phase 1 voltage  × 10   V      */
-int32_t LoRa_GetV2x10(void);    /* Phase 2 voltage  × 10   V      */
-int32_t LoRa_GetV3x10(void);    /* Phase 3 voltage  × 10   V      */
-int32_t LoRa_GetI1x100(void);   /* Phase 1 current  × 100  A      */
-int32_t LoRa_GetI2x100(void);   /* Phase 2 current  × 100  A      */
-int32_t LoRa_GetI3x100(void);   /* Phase 3 current  × 100  A      */
-int32_t LoRa_GetKWx10(void);    /* Total active power × 10 kW     */
-int32_t LoRa_GetKWh(void);      /* Import energy integer   kWh    */
-
 #endif /* LORA_H */
