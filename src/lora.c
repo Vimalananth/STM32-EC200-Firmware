@@ -34,6 +34,13 @@ static UART_HandleTypeDef *lora_uart = NULL;
 static char     lora_line[LORA_LINE_MAX];
 static uint16_t lora_pos = 0;
 
+/* ─── pending command retry ──────────────────────────────────────────────── */
+#define LORA_CMD_ACK_TIMEOUT_MS  5000U   /* wait 5 s for ACK before retry    */
+#define LORA_CMD_MAX_RETRIES     5U      /* give up after 5 retries           */
+static char     lora_pending_msg[16] = "";  /* e.g. "P1:ON" — empty = none   */
+static uint32_t lora_pending_sent_ms = 0;
+static uint8_t  lora_pending_retries = 0;
+
 /* slave relay states — updated whenever a heartbeat/ack arrives */
 static int   lora_relay3_state = -1;  /* -1 = unknown, 0 = OFF, 1 = ON */
 static int   lora_relay4_state = -1;
@@ -199,15 +206,21 @@ static void lora_process_rcv(const char *line)
         return;
     }
 
-    /* Parse ack: P1:ON OK or P1:OFF OK */
+    /* Parse ack: P1:ON OK or P1:OFF OK  — also clears pending command */
     if (strncmp(data, "P1:", 3) == 0)
     {
         lora_relay3_state = (strncmp(data + 3, "ON", 2) == 0) ? 1 : 0;
+        if (lora_pending_msg[0] != '\0' &&
+            strncmp(data, lora_pending_msg, strlen(lora_pending_msg)) == 0)
+            lora_pending_msg[0] = '\0';   /* ACK received — cancel retry */
         return;
     }
     if (strncmp(data, "P2:", 3) == 0)
     {
         lora_relay4_state = (strncmp(data + 3, "ON", 2) == 0) ? 1 : 0;
+        if (lora_pending_msg[0] != '\0' &&
+            strncmp(data, lora_pending_msg, strlen(lora_pending_msg)) == 0)
+            lora_pending_msg[0] = '\0';   /* ACK received — cancel retry */
         return;
     }
 }
@@ -257,6 +270,12 @@ void LoRa_SendRelay(int relay_num, bool on)
     char msg[16];
     snprintf(msg, sizeof(msg), "P%d:%s", relay_num, on ? "ON" : "OFF");
 
+    /* Save as pending — LoRa_Process() will retry if no ACK within 5 s */
+    strncpy(lora_pending_msg, msg, sizeof(lora_pending_msg) - 1);
+    lora_pending_msg[sizeof(lora_pending_msg) - 1] = '\0';
+    lora_pending_sent_ms = HAL_GetTick();
+    lora_pending_retries = 0;
+
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "AT+SEND=%s,%d,%s",
              LORA_SLAVE_ADDR, (int)strlen(msg), msg);
@@ -271,6 +290,36 @@ void LoRa_SendRelay(int relay_num, bool on)
 void LoRa_Process(void)
 {
     if (!lora_uart) return;
+
+    /* ─── pending command retry ──────────────────────────────────────────
+     * If no ACK within LORA_CMD_ACK_TIMEOUT_MS, resend up to MAX_RETRIES. */
+    if (lora_pending_msg[0] != '\0' &&
+        HAL_GetTick() - lora_pending_sent_ms >= LORA_CMD_ACK_TIMEOUT_MS)
+    {
+        if (lora_pending_retries < LORA_CMD_MAX_RETRIES)
+        {
+            lora_pending_retries++;
+            lora_pending_sent_ms = HAL_GetTick();
+
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "AT+SEND=%s,%d,%s",
+                     LORA_SLAVE_ADDR, (int)strlen(lora_pending_msg), lora_pending_msg);
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg), "[LoRa] retry %u/%u -> %s\r\n",
+                     (unsigned)lora_pending_retries, (unsigned)LORA_CMD_MAX_RETRIES,
+                     lora_pending_msg);
+            Debug_Print(dbg);
+            lora_send_cmd(cmd);
+        }
+        else
+        {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg), "[LoRa] cmd FAILED after %u retries: %s\r\n",
+                     (unsigned)LORA_CMD_MAX_RETRIES, lora_pending_msg);
+            Debug_Print(dbg);
+            lora_pending_msg[0] = '\0';
+        }
+    }
 
     uint8_t b;
     while (lora_getc(&b))
