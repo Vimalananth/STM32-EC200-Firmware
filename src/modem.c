@@ -66,7 +66,8 @@ extern const char g_fw_ver[];
 #define TOPIC_OTA_STATUS "pump/" PUMP_ID "/ota/status"
 #define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
 #define TOPIC_LOG        "pump/" PUMP_ID "/log"
-#define TOPIC_SLAVE_LOG  "pump/" PUMP_ID "/slave_log"  /* LoRa slave heartbeat log */
+#define TOPIC_SLAVE_STATUS "pump/" PUMP_ID "/slave_status" /* LoRa slave live status (set) */
+#define TOPIC_SLAVE_VLOG   "pump/" PUMP_ID "/slave_vlog"   /* LoRa slave voltage log (push) */
 #define TOPIC_LORA_OTA   "pump/" PUMP_ID "/lora_ota"  /* Blue Pill OTA trigger URL */
 /* relay2 — same STM32, topics derived from PUMP_ID2 */
 #define TOPIC_CMD2       "pump/" PUMP_ID2 "/cmd"
@@ -2598,6 +2599,23 @@ static void modem_ota_start(const char *url, uint32_t expected_crc32)
     mqtt_state = MQTT_STATE_DISCONNECTED;
     HAL_IWDG_Refresh(&hiwdg);
 
+    /* Switch to 9600 baud for reliable OTA binary streaming.
+     * At 115200: ~11.5 bytes arrive per 1ms flash write → FIFO overflows → CRC mismatch.
+     * At   9600: ~0.96 bytes per 1ms flash write → no overflow → reliable stream.
+     * AT+IPR=115200 in OTA_ST_REBOOT restores EC200U baud before STM32 reset.
+     * MX_USART1_UART_Init() in the new firmware restores STM32 UART to 115200. */
+    modem_cmd("AT+IPR=9600");
+    if (modem_sync_expect("OK", 3000)) {
+        HAL_Delay(50);
+        modem_uart->Init.BaudRate = 9600;
+        HAL_UART_Init(modem_uart);
+        HAL_Delay(50);
+        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+        Debug_Print("[OTA] UART switched to 9600 baud\r\n");
+    } else {
+        Debug_Print("[OTA] WARN: AT+IPR=9600 failed — streaming at 115200\r\n");
+    }
+
     /* URL + HTTP config are already set above; start directly from GET. */
     OTA_SetExpectedCRC(expected_crc32);
     OTA_StartFromGet(url);
@@ -3122,45 +3140,87 @@ void Modem_Process(void)
             pub_status2_needed = true; /* deferred — queue busy after publish_status() */
         }
 
-        /* LoRa heartbeat log every 60 s */
+        /* LoRa slave_status — set() every 60 s (online or offline) */
         if (HAL_GetTick() - lora_log_last_ms >= LORA_LOG_INTERVAL_MS)
         {
             lora_log_last_ms = HAL_GetTick();
-            uint64_t ts = Modem_GetUnixMs();
-            uint32_t age_s = LoRa_GetLastRcvAge();
-            if (age_s == 0xFFFFFFFFUL) age_s = 0;
-            else                        age_s /= 1000;
-            /* fl_x10: L/min × 10 (e.g. 125 = 12.5 L/min) — integer to avoid %f */
-            uint32_t fl_x10  = LoRa_GetFlowLpmX10();
-            uint32_t tv_l    = LoRa_GetTotalLitresInt();
-            uint32_t tv_tot  = LoRa_GetTvCumulative();
-            char lora_log[192];
-            if (ts)
-                snprintf(lora_log, sizeof(lora_log),
-                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
-                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu,\"ts\":%llu}",
-                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
-                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                         (unsigned long)age_s,
-                         (unsigned long)(fl_x10 / 10U),
-                         (unsigned long)(fl_x10 % 10U),
-                         (unsigned long)tv_l,
-                         (unsigned long)tv_tot,
-                         (unsigned long long)ts);
+            uint32_t age_raw = LoRa_GetLastRcvAge();
+            uint64_t ts      = Modem_GetUnixMs();
+
+            if (age_raw == 0xFFFFFFFFUL || age_raw / 1000 > 120)
+            {
+                /* Slave offline — publish minimal offline status */
+                char off_st[48];
+                if (ts)
+                    snprintf(off_st, sizeof(off_st),
+                             "{\"online\":false,\"ts\":%llu}", (unsigned long long)ts);
+                else
+                    snprintf(off_st, sizeof(off_st), "{\"online\":false}");
+                queue_publish(TOPIC_SLAVE_STATUS, off_st);
+            }
             else
-                snprintf(lora_log, sizeof(lora_log),
-                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
-                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu}",
-                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
-                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                         (unsigned long)age_s,
-                         (unsigned long)(fl_x10 / 10U),
-                         (unsigned long)(fl_x10 % 10U),
-                         (unsigned long)tv_l,
-                         (unsigned long)tv_tot);
-            queue_publish(TOPIC_SLAVE_LOG, lora_log);
+            {
+                /* Slave online — build full status */
+                uint32_t age_s  = age_raw / 1000;
+                uint32_t fl_x10 = LoRa_GetFlowLpmX10();
+                uint32_t tv_l   = LoRa_GetTotalLitresInt();
+                char slave_st[320];
+                int slen = snprintf(slave_st, sizeof(slave_st),
+                             "{\"online\":true,\"relay\":%d"
+                             ",\"rssi\":%d,\"snr\":%d,\"age_s\":%lu"
+                             ",\"fl\":%lu.%lu,\"tv\":%lu",
+                             (LoRa_GetRelay3State() == 1) ? 1 : 0,
+                             LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                             (unsigned long)age_s,
+                             (unsigned long)(fl_x10 / 10U),
+                             (unsigned long)(fl_x10 % 10U),
+                             (unsigned long)tv_l);
+                if (LoRa_IsModbusValid() && slen > 0 && slen < (int)sizeof(slave_st) - 120)
+                    slen += snprintf(slave_st + slen, sizeof(slave_st) - (size_t)slen,
+                             ",\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
+                             ",\"i1\":%ld.%02ld,\"i2\":%ld.%02ld,\"i3\":%ld.%02ld"
+                             ",\"kw\":%ld.%ld,\"kwh\":%lu",
+                             (long)(LoRa_GetV1x10()  / 10), (long)(LoRa_GetV1x10()  % 10),
+                             (long)(LoRa_GetV2x10()  / 10), (long)(LoRa_GetV2x10()  % 10),
+                             (long)(LoRa_GetV3x10()  / 10), (long)(LoRa_GetV3x10()  % 10),
+                             (long)(LoRa_GetI1x100() / 100),(long)(LoRa_GetI1x100() % 100),
+                             (long)(LoRa_GetI2x100() / 100),(long)(LoRa_GetI2x100() % 100),
+                             (long)(LoRa_GetI3x100() / 100),(long)(LoRa_GetI3x100() % 100),
+                             (long)(LoRa_GetKWx10()  / 10), (long)(LoRa_GetKWx10()  % 10),
+                             (unsigned long)LoRa_GetKWh());
+                if (ts && slen > 0 && slen < (int)sizeof(slave_st) - 25)
+                    snprintf(slave_st + slen, sizeof(slave_st) - (size_t)slen,
+                             ",\"ts\":%llu}", (unsigned long long)ts);
+                else if (slen > 0 && slen < (int)sizeof(slave_st) - 2)
+                    slave_st[slen] = '}', slave_st[slen + 1] = '\0';
+                queue_publish(TOPIC_SLAVE_STATUS, slave_st);
+            }
+        }
+
+        /* LoRa slave voltage log — push every 5 min when Modbus valid */
+        static uint32_t slave_vlog_last_ms = 0;
+        if (HAL_GetTick() - slave_vlog_last_ms >= 300000U && LoRa_IsModbusValid())
+        {
+            slave_vlog_last_ms = HAL_GetTick();
+            uint64_t ts = Modem_GetUnixMs();
+            char slave_vl[192];
+            int vlen = snprintf(slave_vl, sizeof(slave_vl),
+                         "{\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
+                         ",\"i1\":%ld.%02ld,\"i2\":%ld.%02ld,\"i3\":%ld.%02ld"
+                         ",\"kw\":%ld.%ld",
+                         (long)(LoRa_GetV1x10()  / 10), (long)(LoRa_GetV1x10()  % 10),
+                         (long)(LoRa_GetV2x10()  / 10), (long)(LoRa_GetV2x10()  % 10),
+                         (long)(LoRa_GetV3x10()  / 10), (long)(LoRa_GetV3x10()  % 10),
+                         (long)(LoRa_GetI1x100() / 100),(long)(LoRa_GetI1x100() % 100),
+                         (long)(LoRa_GetI2x100() / 100),(long)(LoRa_GetI2x100() % 100),
+                         (long)(LoRa_GetI3x100() / 100),(long)(LoRa_GetI3x100() % 100),
+                         (long)(LoRa_GetKWx10()  / 10), (long)(LoRa_GetKWx10()  % 10));
+            if (ts && vlen > 0 && vlen < (int)sizeof(slave_vl) - 25)
+                snprintf(slave_vl + vlen, sizeof(slave_vl) - (size_t)vlen,
+                         ",\"ts\":%llu}", (unsigned long long)ts);
+            else if (vlen > 0 && vlen < (int)sizeof(slave_vl) - 2)
+                slave_vl[vlen] = '}', slave_vl[vlen + 1] = '\0';
+            queue_publish(TOPIC_SLAVE_VLOG, slave_vl);
         }
 
         /* run protection every 1 s */

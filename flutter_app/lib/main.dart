@@ -136,6 +136,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
 
   late final List<SiteConfig> _sites;
   final Map<String, bool?> _pumpOn = {};
+  bool _showRotation = true;
 
   @override
   void initState() {
@@ -151,6 +152,12 @@ class _PumpDashboardState extends State<PumpDashboard> {
       }
     }
     _initFCM();
+    _loadShowRotation();
+  }
+
+  Future<void> _loadShowRotation() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) setState(() => _showRotation = prefs.getBool('show_rotation_card') ?? true);
   }
 
   Future<void> _initFCM() async {
@@ -221,7 +228,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
               MaterialPageRoute(builder: (_) => SettingsPage(
                 pumpIds: _sites.expand((s) => s.pumpIds).toList(),
               )),
-            ),
+            ).then((_) => _loadShowRotation()),
           ),
           IconButton(
             icon: const Icon(Icons.logout),
@@ -240,6 +247,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
                 pumpOn: _pumpOn,
                 onPumpToggle: _handlePumpToggle,
                 showHeader: _sites.length > 1,
+                showRotation: _showRotation,
               ),
           ],
         ),
@@ -254,12 +262,14 @@ class _SiteSection extends StatelessWidget {
   final Map<String, bool?> pumpOn;
   final Future<void> Function(String pumpId, bool on) onPumpToggle;
   final bool showHeader;
+  final bool showRotation;
 
   const _SiteSection({
     required this.site,
     required this.pumpOn,
     required this.onPumpToggle,
     required this.showHeader,
+    required this.showRotation,
   });
 
   @override
@@ -291,6 +301,7 @@ class _SiteSection extends StatelessWidget {
                 .any((p) => pumpOn[p] == true),
             otherPumpName: 'Pump ${i == 0 ? 2 : 1}',
             onPumpToggle: (val) => onPumpToggle(site.pumpIds[i], val),
+            showSchedule: showRotation,
           ),
           const SizedBox(height: 16),
         ],
@@ -301,7 +312,7 @@ class _SiteSection extends StatelessWidget {
         ),
         if (site.hasSlave) ...[
           const SizedBox(height: 16),
-          FlowMeterCard(deviceId: site.deviceId),
+          SlaveStatusCard(deviceId: site.deviceId),
         ],
       ],
     );
@@ -514,6 +525,7 @@ class PumpCard extends StatefulWidget {
   final bool otherPumpOn;
   final String otherPumpName;
   final Future<void> Function(bool) onPumpToggle;
+  final bool showSchedule;
 
   const PumpCard({
     super.key,
@@ -524,6 +536,7 @@ class PumpCard extends StatefulWidget {
     required this.otherPumpOn,
     required this.otherPumpName,
     required this.onPumpToggle,
+    this.showSchedule = true,
   });
 
   @override
@@ -893,92 +906,93 @@ class _PumpCardState extends State<PumpCard> {
             ],
 
             // ── Schedule section ──────────────────────────────────────────────
-            InkWell(
-              onTap: () => setState(() => _schedExpanded = !_schedExpanded),
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.blue.shade200),
+            if (widget.showSchedule) ...[
+              InkWell(
+                onTap: () => setState(() => _schedExpanded = !_schedExpanded),
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.blue.shade200),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.schedule, size: 18, color: Colors.blue),
+                      const SizedBox(width: 6),
+                      const Text('Schedule',
+                          style: TextStyle(fontWeight: FontWeight.w600, color: Colors.blue)),
+                      const Spacer(),
+                      if (_schedEnabled)
+                        Text('${_fmt(_schedOnTime)} – ${_fmt(_schedOffTime)}',
+                            style: const TextStyle(fontSize: 12, color: Colors.blue)),
+                      const SizedBox(width: 6),
+                      Icon(
+                        _schedExpanded ? Icons.expand_less : Icons.expand_more,
+                        color: Colors.blue,
+                      ),
+                    ],
+                  ),
                 ),
-                child: Row(
+              ),
+              if (_schedExpanded) ...[
+                const SizedBox(height: 10),
+                // Enable toggle
+                Row(
                   children: [
-                    const Icon(Icons.schedule, size: 18, color: Colors.blue),
-                    const SizedBox(width: 6),
-                    const Text('Schedule',
-                        style: TextStyle(fontWeight: FontWeight.w600, color: Colors.blue)),
+                    const Text('Enable schedule'),
                     const Spacer(),
-                    if (_schedEnabled)
-                      Text('${_fmt(_schedOnTime)} – ${_fmt(_schedOffTime)}',
-                          style: const TextStyle(fontSize: 12, color: Colors.blue)),
-                    const SizedBox(width: 6),
-                    Icon(
-                      _schedExpanded ? Icons.expand_less : Icons.expand_more,
-                      color: Colors.blue,
+                    Switch(
+                      value: _schedEnabled,
+                      onChanged: (v) => setState(() => _schedEnabled = v),
                     ),
                   ],
                 ),
-              ),
-            ),
-
-            if (_schedExpanded) ...[
-              const SizedBox(height: 10),
-              // Enable toggle
-              Row(
-                children: [
-                  const Text('Enable schedule'),
-                  const Spacer(),
-                  Switch(
-                    value: _schedEnabled,
-                    onChanged: (v) => setState(() => _schedEnabled = v),
+                if (_schedEnabled) ...[
+                  const SizedBox(height: 6),
+                  // ON time row
+                  Row(
+                    children: [
+                      const Icon(Icons.power_settings_new,
+                          size: 16, color: Colors.green),
+                      const SizedBox(width: 6),
+                      const Text('Turn ON at'),
+                      const Spacer(),
+                      TextButton(
+                        onPressed: () => _pickTime(true),
+                        child: Text(_fmt(_schedOnTime),
+                            style: const TextStyle(
+                                fontSize: 16, fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+                  ),
+                  // OFF time row
+                  Row(
+                    children: [
+                      const Icon(Icons.power_off, size: 16, color: Colors.red),
+                      const SizedBox(width: 6),
+                      const Text('Turn OFF at'),
+                      const Spacer(),
+                      TextButton(
+                        onPressed: () => _pickTime(false),
+                        child: Text(_fmt(_schedOffTime),
+                            style: const TextStyle(
+                                fontSize: 16, fontWeight: FontWeight.bold)),
+                      ),
+                    ],
                   ),
                 ],
-              ),
-              if (_schedEnabled) ...[
-                const SizedBox(height: 6),
-                // ON time row
-                Row(
-                  children: [
-                    const Icon(Icons.power_settings_new,
-                        size: 16, color: Colors.green),
-                    const SizedBox(width: 6),
-                    const Text('Turn ON at'),
-                    const Spacer(),
-                    TextButton(
-                      onPressed: () => _pickTime(true),
-                      child: Text(_fmt(_schedOnTime),
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.bold)),
-                    ),
-                  ],
-                ),
-                // OFF time row
-                Row(
-                  children: [
-                    const Icon(Icons.power_off, size: 16, color: Colors.red),
-                    const SizedBox(width: 6),
-                    const Text('Turn OFF at'),
-                    const Spacer(),
-                    TextButton(
-                      onPressed: () => _pickTime(false),
-                      child: Text(_fmt(_schedOffTime),
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.bold)),
-                    ),
-                  ],
+                const SizedBox(height: 4),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.save, size: 16),
+                    label: const Text('Save Schedule'),
+                    onPressed: _saveSchedule,
+                  ),
                 ),
               ],
-              const SizedBox(height: 4),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.save, size: 16),
-                  label: const Text('Save Schedule'),
-                  onPressed: _saveSchedule,
-                ),
-              ),
             ],
           ],
         ),
@@ -1086,31 +1100,25 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
   }
 }
 
-// ─── Flow Meter Card ──────────────────────────────────────────────────────────
-class FlowMeterCard extends StatefulWidget {
+// ─── Slave Status Card ────────────────────────────────────────────────────────
+class SlaveStatusCard extends StatefulWidget {
   final String deviceId;
-  const FlowMeterCard({super.key, required this.deviceId});
+  const SlaveStatusCard({super.key, required this.deviceId});
   @override
-  State<FlowMeterCard> createState() => _FlowMeterCardState();
+  State<SlaveStatusCard> createState() => _SlaveStatusCardState();
 }
 
-class _FlowMeterCardState extends State<FlowMeterCard> {
+class _SlaveStatusCardState extends State<SlaveStatusCard> {
   final db = FirebaseDatabase.instance;
-  Map<String, dynamic> _log = {};
+  Map<String, dynamic> _s = {};
   StreamSubscription<DatabaseEvent>? _sub;
 
   @override
   void initState() {
     super.initState();
-    _sub = db
-        .ref('pumps/${widget.deviceId}/slave_log')
-        .limitToLast(1)
-        .onChildAdded
-        .listen((event) {
+    _sub = db.ref('pumps/${widget.deviceId}/slave_status').onValue.listen((event) {
       final data = event.snapshot.value;
-      if (data != null && mounted) {
-        setState(() => _log = Map<String, dynamic>.from(data as Map));
-      }
+      if (mounted) setState(() => _s = data != null ? Map<String, dynamic>.from(data as Map) : {});
     });
   }
 
@@ -1122,17 +1130,16 @@ class _FlowMeterCardState extends State<FlowMeterCard> {
 
   @override
   Widget build(BuildContext context) {
-    if (_log.isEmpty) {
+    if (_s.isEmpty) {
       return Card(
         elevation: 2,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         child: const Padding(
           padding: EdgeInsets.all(16),
           child: Row(children: [
-            Icon(Icons.water_drop, color: Colors.blueGrey),
+            Icon(Icons.electrical_services, color: Colors.blueGrey),
             SizedBox(width: 8),
-            Text('Flow Meter',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            Text('Slave Unit', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             Spacer(),
             Text('No data', style: TextStyle(color: Colors.grey)),
           ]),
@@ -1140,16 +1147,22 @@ class _FlowMeterCardState extends State<FlowMeterCard> {
       );
     }
 
-    final int fl      = ((_log['fl']       ?? 0) as num).toInt();
-    final int tv      = ((_log['tv']       ?? 0) as num).toInt();
-    final int tvTotal = ((_log['tv_total'] ?? 0) as num).toInt();
-    final int rssi    = ((_log['rssi']     ?? 0) as num).toInt();
-    final int ageS    = ((_log['age_s']    ?? 0) as num).toInt();
-    final bool flowing = fl > 0;
-    final bool stale   = ageS > 120;
-    final Color rssiColor = rssi < -95 ? Colors.red
-                          : rssi < -85 ? Colors.orange
-                          : Colors.green;
+    final bool online  = _s['online']  == true;
+    final int  relay   = ((_s['relay'] ?? 0)    as num).toInt();
+    final int  rssi    = ((_s['rssi']  ?? 0)    as num).toInt();
+    final int  ageS    = ((_s['age_s'] ?? 0)    as num).toInt();
+    final double v1    = ((_s['v1']    ?? 0.0)  as num).toDouble();
+    final double v2    = ((_s['v2']    ?? 0.0)  as num).toDouble();
+    final double v3    = ((_s['v3']    ?? 0.0)  as num).toDouble();
+    final double i1    = ((_s['i1']    ?? 0.0)  as num).toDouble();
+    final double i2    = ((_s['i2']    ?? 0.0)  as num).toDouble();
+    final double i3    = ((_s['i3']    ?? 0.0)  as num).toDouble();
+    final double kw    = ((_s['kw']    ?? 0.0)  as num).toDouble();
+    final int    kwh   = ((_s['kwh']   ?? 0)    as num).toInt();
+    final double fl    = ((_s['fl']    ?? 0.0)  as num).toDouble();
+    final int    tv    = ((_s['tv']    ?? 0)    as num).toInt();
+    final bool hasEM   = v1 > 0 || v2 > 0 || v3 > 0;
+    final Color rssiColor = rssi < -95 ? Colors.red : rssi < -85 ? Colors.orange : Colors.green;
 
     return Card(
       elevation: 2,
@@ -1159,48 +1172,93 @@ class _FlowMeterCardState extends State<FlowMeterCard> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ── Header ───────────────────────────────────────────────────────
             Row(children: [
-              Icon(Icons.water_drop,
-                  color: flowing ? Colors.blue : Colors.blueGrey),
+              const Icon(Icons.electrical_services, color: Colors.blueGrey),
               const SizedBox(width: 8),
-              const Text('Flow Meter',
+              const Text('Slave Unit',
                   style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
               const Spacer(),
-              Icon(Icons.router, color: rssiColor, size: 16),
-              const SizedBox(width: 4),
-              Text('$rssi dBm',
-                  style: TextStyle(fontSize: 11, color: rssiColor)),
-              const SizedBox(width: 10),
-              Icon(stale ? Icons.warning_amber : Icons.check_circle,
-                  color: stale ? Colors.orange : Colors.green, size: 14),
-              const SizedBox(width: 4),
-              Text('${ageS}s ago',
-                  style: TextStyle(
-                      fontSize: 11,
-                      color: stale ? Colors.orange : Colors.grey)),
+              // Online / Offline badge
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: online ? Colors.green : Colors.red,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(online ? 'ONLINE' : 'OFFLINE',
+                    style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+              ),
             ]),
-            const Divider(),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                _FlowChip(
-                    label: 'Flow Rate',
-                    value: '$fl L/min',
-                    icon: Icons.speed,
-                    color: flowing ? Colors.blue : Colors.grey),
-                _FlowChip(
-                    label: 'Session',
-                    value: '$tv L',
-                    icon: Icons.water,
-                    color: Colors.teal),
-                _FlowChip(
-                    label: 'Total',
-                    value: '$tvTotal L',
-                    icon: Icons.storage,
-                    color: Colors.indigo),
+            const SizedBox(height: 6),
+
+            // ── Relay state + signal ──────────────────────────────────────────
+            Row(children: [
+              Icon(relay == 1 ? Icons.power : Icons.power_off,
+                  size: 16, color: relay == 1 ? Colors.green : Colors.grey),
+              const SizedBox(width: 4),
+              Text('Relay: ${relay == 1 ? "ON" : "OFF"}',
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: relay == 1 ? Colors.green : Colors.grey)),
+              const Spacer(),
+              if (online) ...[
+                Icon(Icons.router, size: 14, color: rssiColor),
+                const SizedBox(width: 3),
+                Text('$rssi dBm', style: TextStyle(fontSize: 11, color: rssiColor)),
+                const SizedBox(width: 8),
+                Text('${ageS}s ago', style: const TextStyle(fontSize: 11, color: Colors.grey)),
               ],
-            ),
+            ]),
+
+            if (online && hasEM) ...[
+              const Divider(height: 16),
+
+              // ── Voltages ───────────────────────────────────────────────────
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _VoltageChip(label: 'L1', voltage: v1),
+                  _VoltageChip(label: 'L2', voltage: v2),
+                  _VoltageChip(label: 'L3', voltage: v3),
+                ],
+              ),
+              const SizedBox(height: 10),
+
+              // ── Current ────────────────────────────────────────────────────
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _CurrentChip(label: 'I1', current: i1),
+                  _CurrentChip(label: 'I2', current: i2),
+                  _CurrentChip(label: 'I3', current: i3),
+                ],
+              ),
+              const SizedBox(height: 10),
+
+              // ── Power + kWh ────────────────────────────────────────────────
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _SlaveChip(label: 'Power',  value: '${kw.toStringAsFixed(1)} kW',  icon: Icons.bolt,          color: Colors.amber),
+                  _SlaveChip(label: 'Energy', value: '$kwh kWh',                      icon: Icons.electric_meter, color: Colors.deepOrange),
+                ],
+              ),
+            ],
+
+            if (online) ...[
+              const Divider(height: 16),
+
+              // ── Flow ───────────────────────────────────────────────────────
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _SlaveChip(label: 'Flow Rate', value: '${fl.toStringAsFixed(1)} L/min', icon: Icons.speed,   color: fl > 0 ? Colors.blue : Colors.grey),
+                  _SlaveChip(label: 'Session',   value: '$tv L',                           icon: Icons.water,   color: Colors.teal),
+                ],
+              ),
+            ],
           ],
         ),
       ),
@@ -1208,30 +1266,21 @@ class _FlowMeterCardState extends State<FlowMeterCard> {
   }
 }
 
-class _FlowChip extends StatelessWidget {
+class _SlaveChip extends StatelessWidget {
   final String label;
   final String value;
   final IconData icon;
   final Color color;
-  const _FlowChip(
-      {required this.label,
-      required this.value,
-      required this.icon,
-      required this.color});
+  const _SlaveChip({required this.label, required this.value, required this.icon, required this.color});
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        Icon(icon, color: color, size: 22),
+        Icon(icon, color: color, size: 20),
         const SizedBox(height: 4),
-        Text(value,
-            style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.bold,
-                color: color)),
-        Text(label,
-            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        Text(value, style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: color)),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
       ],
     );
   }
@@ -1273,7 +1322,8 @@ class _VoltageChip extends StatelessWidget {
 // ─── Current chip ─────────────────────────────────────────────────────────────
 class _CurrentChip extends StatelessWidget {
   final double current;
-  const _CurrentChip({required this.current});
+  final String label;
+  const _CurrentChip({required this.current, this.label = 'I'});
 
   Color _color() {
     if (current <= 0.0) return Colors.grey;
@@ -1292,7 +1342,7 @@ class _CurrentChip extends StatelessWidget {
       ),
       child: Column(
         children: [
-          Text('I', style: TextStyle(color: _color(), fontWeight: FontWeight.bold)),
+          Text(label, style: TextStyle(color: _color(), fontWeight: FontWeight.bold)),
           Text('${current.toStringAsFixed(2)}A',
               style: TextStyle(color: _color(), fontSize: 13)),
         ],
@@ -1359,6 +1409,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   // Global notification toggle (stored in SharedPreferences)
   bool _notifEnabled = true;
+  // Schedule card visibility (stored in SharedPreferences)
+  bool _showRotation = true;
 
   StreamSubscription<DatabaseEvent>? _settingsSub;
   StreamSubscription<DatabaseEvent>? _devSub;
@@ -1374,7 +1426,18 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _loadNotifPref() async {
     final prefs = await SharedPreferences.getInstance();
-    if (mounted) setState(() => _notifEnabled = prefs.getBool('notifications_enabled') ?? true);
+    if (mounted) {
+      setState(() {
+        _notifEnabled = prefs.getBool('notifications_enabled') ?? true;
+        _showRotation = prefs.getBool('show_rotation_card')    ?? true;
+      });
+    }
+  }
+
+  Future<void> _setShowRotation(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('show_rotation_card', enabled);
+    if (mounted) setState(() => _showRotation = enabled);
   }
 
   Future<void> _setNotifEnabled(bool enabled) async {
@@ -1633,6 +1696,28 @@ class _SettingsPageState extends State<SettingsPage> {
                             Switch(
                               value: _notifEnabled,
                               onChanged: _setNotifEnabled,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // ── Schedule visibility ──────────────────────────────
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.schedule, size: 20, color: Colors.teal),
+                            const SizedBox(width: 10),
+                            const Expanded(
+                              child: Text('Show Schedule',
+                                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                            ),
+                            Switch(
+                              value: _showRotation,
+                              activeThumbColor: Colors.teal,
+                              onChanged: _setShowRotation,
                             ),
                           ],
                         ),

@@ -44,6 +44,17 @@ static uint32_t lora_total_litres_int = 0; /* tv from last heartbeat (resets on 
 static uint32_t lora_tv_prev         = 0; /* previous tv — reboot detection     */
 static uint32_t lora_tv_cumulative   = 0; /* true cumulative litres, never resets */
 
+/* slave EM4M energy meter — parsed from heartbeat when Blue Pill Modbus is valid */
+static bool     lora_modbus_valid = false;
+static int32_t  lora_v1x10  = 0;  /* phase 1 voltage × 10  (e.g. 2305 = 230.5 V) */
+static int32_t  lora_v2x10  = 0;
+static int32_t  lora_v3x10  = 0;
+static int32_t  lora_i1x100 = 0;  /* phase 1 current × 100 (e.g.  125 = 1.25 A)  */
+static int32_t  lora_i2x100 = 0;
+static int32_t  lora_i3x100 = 0;
+static int32_t  lora_kwx10  = 0;  /* total kW × 10         (e.g.   45 = 4.5 kW)  */
+static uint32_t lora_kwh    = 0;  /* total kWh (integer)                           */
+
 /* last received +RCV signal quality */
 static int      lora_last_rssi     = 0;
 static int      lora_last_snr      = 0;
@@ -159,6 +170,21 @@ static void lora_process_rcv(const char *line)
                 lora_tv_cumulative += new_tv;                  /* slave rebooted */
             lora_tv_prev          = new_tv;
             lora_total_litres_int = new_tv;
+        }
+
+        /* Parse EM4M energy meter fields — only present when Blue Pill Modbus valid */
+        const char *v1f = strstr(data, "V1:");
+        lora_modbus_valid = (v1f != NULL);
+        if (lora_modbus_valid) {
+            lora_v1x10  = strtol(v1f + 3, NULL, 10);
+            const char *v2f  = strstr(data, "V2:");  if (v2f)  lora_v2x10  = strtol(v2f  + 3, NULL, 10);
+            const char *v3f  = strstr(data, "V3:");  if (v3f)  lora_v3x10  = strtol(v3f  + 3, NULL, 10);
+            const char *i1f  = strstr(data, "I1:");  if (i1f)  lora_i1x100 = strtol(i1f  + 3, NULL, 10);
+            const char *i2f  = strstr(data, "I2:");  if (i2f)  lora_i2x100 = strtol(i2f  + 3, NULL, 10);
+            const char *i3f  = strstr(data, "I3:");  if (i3f)  lora_i3x100 = strtol(i3f  + 3, NULL, 10);
+            /* Use "|KW:" prefix to distinguish from "|KWH:" */
+            const char *kwf  = strstr(data, "|KW:"); if (kwf)  lora_kwx10  = strtol(kwf  + 4, NULL, 10);
+            const char *kwhf = strstr(data, "KWH:"); if (kwhf) lora_kwh    = (uint32_t)strtol(kwhf + 4, NULL, 10);
         }
 
         if (!OTA_IsActive()) {
@@ -296,6 +322,16 @@ uint32_t LoRa_GetFlowLpmX10(void)        { return lora_flow_lpm_x10; }
 uint32_t LoRa_GetTotalLitresInt(void)    { return lora_total_litres_int; }
 /* True cumulative litres — survives slave reboots (resets only on master reboot) */
 uint32_t LoRa_GetTvCumulative(void)      { return lora_tv_cumulative; }
+/* EM4M energy meter fields from Blue Pill heartbeat */
+bool     LoRa_IsModbusValid(void)        { return lora_modbus_valid; }
+int32_t  LoRa_GetV1x10(void)             { return lora_v1x10;  }
+int32_t  LoRa_GetV2x10(void)             { return lora_v2x10;  }
+int32_t  LoRa_GetV3x10(void)             { return lora_v3x10;  }
+int32_t  LoRa_GetI1x100(void)            { return lora_i1x100; }
+int32_t  LoRa_GetI2x100(void)            { return lora_i2x100; }
+int32_t  LoRa_GetI3x100(void)            { return lora_i3x100; }
+int32_t  LoRa_GetKWx10(void)             { return lora_kwx10;  }
+uint32_t LoRa_GetKWh(void)               { return lora_kwh;    }
 /* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
 uint32_t LoRa_GetLastRcvAge(void)
 {

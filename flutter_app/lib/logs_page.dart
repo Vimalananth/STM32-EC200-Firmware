@@ -571,12 +571,20 @@ class _LogsPageState extends State<LogsPage>
     return peak;
   }
 
-  // Total kWh for a 24-h window: kW × (5/60) h per 5-min slot
+  // Total kWh for a 24-h window using actual time deltas between entries.
+  // Avoids inflating kWh when bridge restarts create extra entries at
+  // intervals shorter than 5 minutes.
   double _windowKwhTotal(int winStartMs) {
     final winEndMs = winStartMs + 24 * 3600 * 1000;
+    final entries = _allVlog
+        .where((e) => e.ts >= winStartMs && e.ts < winEndMs)
+        .toList()
+      ..sort((a, b) => a.ts.compareTo(b.ts));
     double total = 0;
-    for (final e in _allVlog) {
-      if (e.ts >= winStartMs && e.ts < winEndMs) total += e.kw / 12.0;
+    for (int i = 1; i < entries.length; i++) {
+      final deltaH = (entries[i].ts - entries[i - 1].ts) / 3600000.0;
+      // Clamp to 10 min max to ignore gaps from device offline / bridge restart
+      total += entries[i - 1].kw * deltaH.clamp(0, 10 / 60.0);
     }
     return total;
   }
