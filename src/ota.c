@@ -858,12 +858,6 @@ void OTA_Process(void)
              * OTA sentinel — that is the proven-reliable place to clear
              * the EC200U TLS heap (double-CFUN caused intermittent
              * APP RDY miss and left the modem unconfigured).           */
-            /* Restore EC200U to 115200 before reset.
-             * modem_ota_start() switched to 9600 for reliable streaming;
-             * the new firmware's MX_USART1_UART_Init() starts at 115200
-             * so EC200U must match.  Sent at 9600 (current baud). */
-            ota_send("AT+IPR=115200");
-            ota_delay_wdg(500);
             Debug_Print("[OTA] QHTTPSTOP+QIDEACT done — resetting STM32\r\n");
             ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();

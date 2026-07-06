@@ -2599,23 +2599,6 @@ static void modem_ota_start(const char *url, uint32_t expected_crc32)
     mqtt_state = MQTT_STATE_DISCONNECTED;
     HAL_IWDG_Refresh(&hiwdg);
 
-    /* Switch to 9600 baud for reliable OTA binary streaming.
-     * At 115200: ~11.5 bytes arrive per 1ms flash write → FIFO overflows → CRC mismatch.
-     * At   9600: ~0.96 bytes per 1ms flash write → no overflow → reliable stream.
-     * AT+IPR=115200 in OTA_ST_REBOOT restores EC200U baud before STM32 reset.
-     * MX_USART1_UART_Init() in the new firmware restores STM32 UART to 115200. */
-    modem_cmd("AT+IPR=9600");
-    if (modem_sync_expect("OK", 3000)) {
-        HAL_Delay(50);
-        modem_uart->Init.BaudRate = 9600;
-        HAL_UART_Init(modem_uart);
-        HAL_Delay(50);
-        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
-        Debug_Print("[OTA] UART switched to 9600 baud\r\n");
-    } else {
-        Debug_Print("[OTA] WARN: AT+IPR=9600 failed — streaming at 115200\r\n");
-    }
-
     /* URL + HTTP config are already set above; start directly from GET. */
     OTA_SetExpectedCRC(expected_crc32);
     OTA_StartFromGet(url);
