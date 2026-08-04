@@ -257,9 +257,11 @@ static uint8_t  noinit_offline_relay2 __attribute__((section(".noinit")));
 static uint32_t noinit_mains_magic  __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_relay1 __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_relay2 __attribute__((section(".noinit")));
+static uint8_t  noinit_mains_slave  __attribute__((section(".noinit")));  /* Blue Pill relay */
 static bool mains_is_off         = false;
 static bool mains_restore_relay1 = false;
 static bool mains_restore_relay2 = false;
+static bool mains_restore_slave  = false;  /* Blue Pill slave relay restore intent */
 
 static uint8_t mqtt_reset_count = 0; /* initialised from noinit RAM in Modem_Init */
 
@@ -890,11 +892,16 @@ static void check_mains_state(void)
          * which relay was running so it can be restored when 12V returns.
          * Prefer noinit if valid: a soft-reboot during mains-off preserves rotation intent. */
         bool ni_valid = (noinit_mains_magic == MAINS_BKUP_MAGIC) &&
-                        (noinit_mains_relay1 <= 1U) && (noinit_mains_relay2 <= 1U);
+                        (noinit_mains_relay1 <= 1U) && (noinit_mains_relay2 <= 1U) &&
+                        (noinit_mains_slave  <= 1U);
         mains_restore_relay1 = ni_valid ? (noinit_mains_relay1 != 0U) : relay1;
         mains_restore_relay2 = ni_valid ? (noinit_mains_relay2 != 0U) : relay2;
+        /* Slave state: prefer noinit; fall back to last known heartbeat state */
+        mains_restore_slave  = ni_valid ? (noinit_mains_slave != 0U)
+                                        : (LoRa_GetRelay3State() == 1);
         noinit_mains_relay1 = mains_restore_relay1 ? 1U : 0U;
         noinit_mains_relay2 = mains_restore_relay2 ? 1U : 0U;
+        noinit_mains_slave  = mains_restore_slave  ? 1U : 0U;
         noinit_mains_magic  = MAINS_BKUP_MAGIC;
 
         /* Mark relays OFF in software and save to flash.  The relay coil is physically
@@ -902,6 +909,11 @@ static void check_mains_state(void)
          * harmless because the pump motor has no AC supply to run on. */
         relay1 = false; relay2 = false;
         RelayState_Save();
+
+        /* Tell slave to record OFF state — same 12V constraint applies to Blue Pill relay.
+         * LoRa module is battery-powered so the command can be transmitted; slave receives
+         * it but the coil pulse is a no-op (slave's 12V also absent). */
+        LoRa_SendRelay(1, false);
 
         mains_is_off = true;
         Debug_Print("[PWR] Mains OFF — state recorded (relay coil unpulseable, no 12V)\r\n");
@@ -933,6 +945,10 @@ static void check_mains_state(void)
             log_relay_event(2, true, "mains_restore");
         }
         RelayState_Save();
+
+        /* Restore slave (Blue Pill) relay — 12V now available at slave too.
+         * P1:ON or P1:OFF as appropriate; redundant coil pulses on latching relay are harmless. */
+        LoRa_SendRelay(1, mains_restore_slave);
         Debug_Print("[PWR] Mains ON — relays reset then correct pump restored\r\n");
     }
     prev_dead = all_dead;
@@ -1989,11 +2005,19 @@ static void process_line(const char *line)
             int r3 = extract_int(json, "relay3");
             if (r3 >= 0) {
                 LoRa_SendRelay(1, r3 == 1);
+                if (mains_is_off) {
+                    mains_restore_slave = (r3 == 1);
+                    noinit_mains_slave  = (r3 == 1) ? 1U : 0U;
+                }
                 Debug_Print(r3 ? "[CMD] LoRa P1 ON\r\n" : "[CMD] LoRa P1 OFF\r\n");
             }
             int r4 = extract_int(json, "relay4");
             if (r4 >= 0) {
                 LoRa_SendRelay(2, r4 == 1);
+                if (mains_is_off) {
+                    mains_restore_slave = (r4 == 1);
+                    noinit_mains_slave  = (r4 == 1) ? 1U : 0U;
+                }
                 Debug_Print(r4 ? "[CMD] LoRa P2 ON\r\n" : "[CMD] LoRa P2 OFF\r\n");
             }
             return;
