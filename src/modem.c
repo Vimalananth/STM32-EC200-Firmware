@@ -66,8 +66,11 @@ extern const char g_fw_ver[];
 #define TOPIC_OTA_STATUS "pump/" PUMP_ID "/ota/status"
 #define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
 #define TOPIC_LOG        "pump/" PUMP_ID "/log"
-#define TOPIC_SLAVE_STATUS "pump/" PUMP_ID "/slave_status" /* LoRa slave live status (set) */
-#define TOPIC_SLAVE_VLOG   "pump/" PUMP_ID "/slave_vlog"   /* LoRa slave voltage log (push) */
+#define TOPIC_LINE2_STATUS   "pump/" PUMP_ID "/slave_status"   /* Blue Pill combined status (set)  */
+#define TOPIC_LINE2_LOG      "pump/" PUMP_ID "/slave_vlog"     /* line2 periodic log (push)        */
+#define TOPIC_LINE2_ALERTS   "pump/" PUMP_ID "/slave_alerts"   /* line2 events: slave on/off (push)*/
+#define TOPIC_VLOG           "pump/" PUMP_ID  "/vlog"          /* line1 pump1 voltage log (push)   */
+#define TOPIC_VLOG2          "pump/" PUMP_ID2 "/vlog"          /* line1 pump2 voltage log (push)   */
 #define TOPIC_LORA_OTA   "pump/" PUMP_ID "/lora_ota"  /* Blue Pill OTA trigger URL */
 /* relay2 — same STM32, topics derived from PUMP_ID2 */
 #define TOPIC_CMD2       "pump/" PUMP_ID2 "/cmd"
@@ -93,15 +96,16 @@ static int   cfg_dry_en2 = 1;    /* 1=dry-run enabled for relay2            */
 static int   cfg_hp2     = 0;    /* relay2 pump rating                       */
 static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
 #define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
+#define VOLT_TRIP_HOLD_S  300U    /* consecutive fault seconds before trip  */
 /* Minimum current to consider the motor actually running.
  * If i < this threshold the motor is completely de-energised (external
  * preventer/timer has opened the contactor) — not a dry-run condition.
  * Dry-run only counts when the motor IS spinning but drawing low current. */
 #define DRY_RUN_MIN_I_A  0.3f
 
-/* ── Heartbeat interval (event-driven: also publish on every state change) ── */
-#define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
-#define LORA_LOG_INTERVAL_MS  60000UL   /* LoRa heartbeat log every 1 min */
+/* ── Publish intervals ───────────────────────────────────────────────────── */
+#define STATUS_KEEPALIVE_MS   10000UL  /* keepalive heartbeat every 10 s (online detection)  */
+#define VLOG_INTERVAL_MS     300000UL  /* voltage log push every 5 min */
 /* QoS0 PUBEX acks can arrive late when modem/network is busy. */
 #define MQTT_PUBACK_TIMEOUT_MS 12000UL
 #define OTA_POST_QMTCLOSE_DELAY_MS 8000UL
@@ -172,16 +176,24 @@ static uint32_t uv_cleared_ms1 = 0;     /* HAL_GetTick() when UV/PL first cleare
 static uint32_t uv_cleared_ms2 = 0;
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
 static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
-static uint8_t  dry_run_count   = 0;
+static uint16_t dry_run_count   = 0;   /* uint16 — cfg_dry_t can be up to 600 s */
 static bool     dry_run_tripped = false;
 static uint32_t lockout_until   = 0;
-static uint8_t  dry_run_count2  = 0;
+static uint16_t dry_run_count2  = 0;
 static bool     dry_run_tripped2 = false;
 static uint32_t lockout_until2  = 0;
+/* Overload counters — trip after 3 consecutive 1-s samples above HP-rated limit */
+static uint8_t  overload_count1   = 0;
+static bool     overload_tripped1 = false;
+static uint8_t  overload_count2   = 0;
+static bool     overload_tripped2 = false;
+/* Voltage hold — require VOLT_TRIP_HOLD_S consecutive fault samples before tripping */
+static uint16_t volt_trip_count1  = 0;
+static uint16_t volt_trip_count2  = 0;
 
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[512];
+static char pub_payload[768];   /* must be >= largest payload (publish_status ~740 B) */
 static bool pub_pending = false;
 /* Exact byte count sent in the last AT+QMTPUBEX command.
  * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
@@ -196,10 +208,14 @@ static bool force_status_after_ota = false;
  * Avoids the drop caused by publish_status() setting pub_pending immediately
  * before publish_status2() is called. */
 static bool pub_status2_needed = false;
+static bool pub_line2_needed   = false; /* deferred line2_status after keepalive  */
+static bool pub_vlog2_needed   = false; /* deferred vlog2 (pump2 voltage log)     */
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
-static uint32_t lora_log_last_ms   = 0;
+/* line2 (Blue Pill slave) event tracking */
+static int      prev_lora_r3_pub   = -2;   /* -2 = uninitialized; triggers first publish */
+static bool     prev_slave_online  = false;
 static uint32_t mqtt_offline_since_ms = 0; /* HAL_GetTick() when MQTT left active state; 0=active */
 
 /* ── MQTT offline backoff watchdog ───────────────────────────────────────────
@@ -232,6 +248,18 @@ static uint8_t  noinit_reset_n __attribute__((section(".noinit")));
 static uint32_t noinit_offline_magic  __attribute__((section(".noinit")));
 static uint8_t  noinit_offline_relay1 __attribute__((section(".noinit")));
 static uint8_t  noinit_offline_relay2 __attribute__((section(".noinit")));
+
+/* Mains power-off state — relay restore intent across mains outage + soft reboots.
+ * 12V relay coil supply is mains-powered; cannot pulse coil during outage.
+ * On mains loss: record which relay was ON so it can be restored when 12V returns. */
+#define MAINS_OFF_V       50.0f
+#define MAINS_BKUP_MAGIC  0x4D41494EU  /* "MAIN" */
+static uint32_t noinit_mains_magic  __attribute__((section(".noinit")));
+static uint8_t  noinit_mains_relay1 __attribute__((section(".noinit")));
+static uint8_t  noinit_mains_relay2 __attribute__((section(".noinit")));
+static bool mains_is_off         = false;
+static bool mains_restore_relay1 = false;
+static bool mains_restore_relay2 = false;
 
 static uint8_t mqtt_reset_count = 0; /* initialised from noinit RAM in Modem_Init */
 
@@ -407,6 +435,12 @@ static void modem_cmd(const char *cmd)
 void Relay1_Set(bool on)
 {
     relay1 = on;
+    if (mains_is_off) {
+        /* 12V relay supply absent — skip GPIO pulse, just record intent for restore */
+        mains_restore_relay1 = on;
+        noinit_mains_relay1  = on ? 1U : 0U;
+        return;
+    }
     if (on) {
         HAL_GPIO_WritePin(Relay_Pin_GPIO_Port,  Relay_Pin_Pin,  GPIO_PIN_SET);   /* PB3 HIGH — SET coil pulse start  */
         HAL_Delay(200);
@@ -421,6 +455,12 @@ void Relay1_Set(bool on)
 void Relay2_Set(bool on)
 {
     relay2 = on;
+    if (mains_is_off) {
+        /* 12V relay supply absent — skip GPIO pulse, just record intent for restore */
+        mains_restore_relay2 = on;
+        noinit_mains_relay2  = on ? 1U : 0U;
+        return;
+    }
     if (on) {
         HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_SET);   /* PB4 HIGH — SET coil pulse start  */
         HAL_Delay(200);
@@ -529,10 +569,16 @@ static void queue_publish(const char *topic, const char *payload)
     if (pub_pending)
         return; /* drop if previous not sent yet      */
 
+    size_t plen = strlen(payload);
+    if (plen >= sizeof(pub_payload)) {
+        /* Refuse to truncate JSON — a partial JSON breaks Firebase parsing */
+        Debug_Print("[PUB] DROPPED: payload too large\r\n");
+        return;
+    }
+
     strncpy(pub_topic, topic, sizeof(pub_topic) - 1);
-    strncpy(pub_payload, payload, sizeof(pub_payload) - 1);
     pub_topic[sizeof(pub_topic) - 1] = '\0';
-    pub_payload[sizeof(pub_payload) - 1] = '\0';
+    memcpy(pub_payload, payload, plen + 1);
     pub_pending = true;
 }
 
@@ -558,6 +604,99 @@ static void fmt_f2(char *out, int sz, float v)
     int   d = (int)((a - (float)w) * 100.0f);
     if (neg) snprintf(out, sz, "-%d.%02d", w, d);
     else     snprintf(out, sz,  "%d.%02d", w, d);
+}
+
+/* ── Voltage log helper — push v1/v2/v3/i/kw to given topic ─────────────── */
+static void publish_vlog_for(const char *topic)
+{
+    float v1 = Sensor_ReadVoltagePhase1();
+    float v2 = Sensor_ReadVoltagePhase2();
+    float v3 = Sensor_ReadVoltagePhase3();
+    float i  = Sensor_ReadCurrentACS712();
+    char sv1[12], sv2[12], sv3[12], sci[12], skw[10], skwh[12];
+    fmt_f1(sv1,  sizeof(sv1),  v1);
+    fmt_f1(sv2,  sizeof(sv2),  v2);
+    fmt_f1(sv3,  sizeof(sv3),  v3);
+    fmt_f2(sci,  sizeof(sci),  i);
+    fmt_f2(skw,  sizeof(skw),  Modbus_GetKW());
+    fmt_f2(skwh, sizeof(skwh), Modbus_GetKWh()); /* meter's cumulative kWh counter */
+    uint64_t ts = Modem_GetUnixMs();
+    char payload[192];   /* enlarged: +kwh field ~14 bytes */
+    int len = snprintf(payload, sizeof(payload),
+                "{\"v1\":%s,\"v2\":%s,\"v3\":%s,\"i\":%s,\"kw\":%s,\"kwh\":%s",
+                sv1, sv2, sv3, sci, skw, skwh);
+    if (ts && len > 0 && len < (int)sizeof(payload) - 25)
+        snprintf(payload + len, sizeof(payload) - (size_t)len,
+                ",\"ts\":%llu}", (unsigned long long)ts);
+    else if (len > 0 && len < (int)sizeof(payload) - 2)
+        payload[len] = '}', payload[len + 1] = '\0';
+    queue_publish(topic, payload);
+}
+
+/* Push line1/pump1 vlog; defers pump2 via pub_vlog2_needed */
+static void publish_vlog(void)
+{
+    publish_vlog_for(TOPIC_VLOG);
+    pub_vlog2_needed = true; /* TOPIC_VLOG2 deferred — queue busy after pump1 push */
+}
+
+/* ── line2 combined status — Blue Pill relay + flow + Modbus readings ────── */
+static void publish_line2_status(void)
+{
+    uint32_t age_raw = LoRa_GetLastRcvAge();
+    uint64_t ts      = Modem_GetUnixMs();
+
+    if (age_raw == 0xFFFFFFFFUL || age_raw / 1000U > 120U)
+    {
+        char off_st[56];
+        if (ts)
+            snprintf(off_st, sizeof(off_st),
+                     "{\"online\":false,\"ts\":%llu}", (unsigned long long)ts);
+        else
+            snprintf(off_st, sizeof(off_st), "{\"online\":false}");
+        queue_publish(TOPIC_LINE2_STATUS, off_st);
+        return;
+    }
+
+    uint32_t age_s    = age_raw / 1000U;
+    uint32_t fl_x10   = LoRa_GetFlowLpmX10();
+    uint32_t tv_l     = LoRa_GetTotalLitresInt();
+    uint32_t depth_mm = LoRa_GetDepthMm();  /* 0xFFFFFFFF = fault/no sensor */
+    char st[320];
+    int slen = snprintf(st, sizeof(st),
+                 "{\"online\":true,\"relay\":%d"
+                 ",\"rssi\":%d,\"snr\":%d,\"age_s\":%lu"
+                 ",\"fl\":%lu.%lu,\"tv\":%lu"
+                 ",\"dp\":%ld",
+                 (LoRa_GetRelay3State() == 1) ? 1 : 0,
+                 LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                 (unsigned long)age_s,
+                 (unsigned long)(fl_x10 / 10U),
+                 (unsigned long)(fl_x10 % 10U),
+                 (unsigned long)tv_l,
+                 (depth_mm == 0xFFFFFFFFUL) ? -1L : (long)depth_mm);
+    if (LoRa_IsModbusValid() && slen > 0 && slen < (int)sizeof(st) - 120)
+        slen += snprintf(st + slen, sizeof(st) - (size_t)slen,
+                 ",\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
+                 ",\"i1\":%ld.%02ld,\"i2\":%ld.%02ld,\"i3\":%ld.%02ld"
+                 ",\"kw\":%ld.%ld,\"kwh\":%lu",
+                 (long)(LoRa_GetV1x10()  / 10), (long)(LoRa_GetV1x10()  % 10),
+                 (long)(LoRa_GetV2x10()  / 10), (long)(LoRa_GetV2x10()  % 10),
+                 (long)(LoRa_GetV3x10()  / 10), (long)(LoRa_GetV3x10()  % 10),
+                 (long)(LoRa_GetI1x100() / 100),(long)(LoRa_GetI1x100() % 100),
+                 (long)(LoRa_GetI2x100() / 100),(long)(LoRa_GetI2x100() % 100),
+                 (long)(LoRa_GetI3x100() / 100),(long)(LoRa_GetI3x100() % 100),
+                 (long)(LoRa_GetKWx10()  / 10), (long)(LoRa_GetKWx10()  % 10),
+                 (unsigned long)LoRa_GetKWh());
+    { uint8_t bp = LoRa_GetSlaveBatPct();
+      if (bp <= 100U && slen > 0 && slen < (int)sizeof(st) - 15)
+          slen += snprintf(st + slen, sizeof(st) - (size_t)slen, ",\"bat\":%u", (unsigned)bp); }
+    if (ts && slen > 0 && slen < (int)sizeof(st) - 25)
+        snprintf(st + slen, sizeof(st) - (size_t)slen,
+                 ",\"ts\":%llu}", (unsigned long long)ts);
+    else if (slen > 0 && slen < (int)sizeof(st) - 2)
+        st[slen] = '}', st[slen + 1] = '\0';
+    queue_publish(TOPIC_LINE2_STATUS, st);
 }
 
 static void publish_status(void)
@@ -587,8 +726,10 @@ static void publish_status(void)
 
     int r3 = LoRa_GetRelay3State();  /* -1=unknown, 0=OFF, 1=ON */
     int r4 = LoRa_GetRelay4State();
+    uint8_t  bat_pct = Battery_ReadPercent();  /* LiPo on PA0; 0xFF if read fails */
+    uint32_t bat_mv  = Battery_ReadMv();       /* raw mV, e.g. 3820              */
 
-    char payload[720];
+    char payload[740];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
@@ -598,6 +739,7 @@ static void publish_status(void)
              "\"dry_run\":%s,\"dry_run2\":%s,\"online\":true,"
              "\"mb_ok\":%d,\"mb_rx\":%d,\"rssi\":%d,\"boot_phase\":%u,"
              "\"fw\":\"%s\","
+             "\"bat\":%u,\"bat_mv\":%lu,"
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
@@ -615,6 +757,7 @@ static void publish_status(void)
              (int)last_rssi,
              (unsigned)g_boot_phase,
              g_fw_ver,
+             (unsigned)bat_pct, (unsigned long)bat_mv,
              scfg_ov, scfg_uv, scfg_pl,
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
@@ -721,8 +864,88 @@ static bool is_volt_fault(void)
            (v1 < cfg_pl || v2 < cfg_pl || v3 < cfg_pl);
 }
 
+/* Return overcurrent trip threshold (A) for the given HP rating.
+ * Based on 415 V 3-phase, PF 0.85, with 150 % thermal overload margin.
+ * Returns 0 when HP = 0 (custom / disabled).
+ *   5HP  = 3730 W → I_rated 6.1 A → 150 % = 9.1 A → trip at 11 A
+ *   7.5HP= 5595 W → I_rated 9.1 A → 150 % = 13.7 A → trip at 16 A  */
+static float overload_limit_for_hp(int hp)
+{
+    if (hp == 5)  return 11.0f;
+    if (hp == 75) return 16.0f;
+    return 0.0f;  /* 0 = disabled */
+}
+
+static void check_mains_state(void)
+{
+    float v1 = Sensor_ReadVoltagePhase1();
+    float v2 = Sensor_ReadVoltagePhase2();
+    float v3 = Sensor_ReadVoltagePhase3();
+    bool all_dead = (v1 < MAINS_OFF_V && v2 < MAINS_OFF_V && v3 < MAINS_OFF_V);
+    static bool prev_dead = false;
+
+    if (!prev_dead && all_dead) {
+        /* ── Mains just went OFF ── */
+        /* 12V relay coil supply is mains-powered — cannot pulse coil now. Just record
+         * which relay was running so it can be restored when 12V returns.
+         * Prefer noinit if valid: a soft-reboot during mains-off preserves rotation intent. */
+        bool ni_valid = (noinit_mains_magic == MAINS_BKUP_MAGIC) &&
+                        (noinit_mains_relay1 <= 1U) && (noinit_mains_relay2 <= 1U);
+        mains_restore_relay1 = ni_valid ? (noinit_mains_relay1 != 0U) : relay1;
+        mains_restore_relay2 = ni_valid ? (noinit_mains_relay2 != 0U) : relay2;
+        noinit_mains_relay1 = mains_restore_relay1 ? 1U : 0U;
+        noinit_mains_relay2 = mains_restore_relay2 ? 1U : 0U;
+        noinit_mains_magic  = MAINS_BKUP_MAGIC;
+
+        /* Mark relays OFF in software and save to flash.  The relay coil is physically
+         * unpulseable (no 12V), so the relay stays mechanically latched — but that is
+         * harmless because the pump motor has no AC supply to run on. */
+        relay1 = false; relay2 = false;
+        RelayState_Save();
+
+        mains_is_off = true;
+        Debug_Print("[PWR] Mains OFF — state recorded (relay coil unpulseable, no 12V)\r\n");
+    }
+    else if (prev_dead && !all_dead) {
+        /* ── Mains just came back ON ── */
+        /* 12V is restored — we can now energise the relay coils. */
+        mains_is_off = false;
+        noinit_mains_magic = 0U;   /* clear mains backup */
+
+        /* Clear UV/PL trip flags so protection does not immediately block restore */
+        uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
+        uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
+
+        /* Step 1: RESET both relay coils to reach a known-OFF state.
+         * The relay may be physically latched ON from before the outage.
+         * Relay*_Set(false) always pulses the RESET coil regardless of current state. */
+        Relay1_Set(false);
+        Relay2_Set(false);
+
+        /* Step 2: Restore the correct relay — interlock ensures only one at a time */
+        if (mains_restore_relay1) {
+            Relay1_Set(true);
+            relay1_on_tick = HAL_GetTick();   /* re-arm startup grace (UV/PL suppression) */
+            log_relay_event(1, true, "mains_restore");
+        } else if (mains_restore_relay2) {
+            Relay2_Set(true);
+            relay2_on_tick = HAL_GetTick();
+            log_relay_event(2, true, "mains_restore");
+        }
+        RelayState_Save();
+        Debug_Print("[PWR] Mains ON — relays reset then correct pump restored\r\n");
+    }
+    prev_dead = all_dead;
+}
+
 static void run_protection(void)
 {
+    /* Skip all protection until the first valid Modbus read arrives.
+     * With zero defaults, both UV and dry-run would fire immediately otherwise. */
+    if (!Modbus_IsDataValid()) return;
+
+    check_mains_state();
+
     static bool prev_r1_running = false;
     static bool prev_r2_running = false;
 
@@ -747,7 +970,14 @@ static void run_protection(void)
     bool volt_trip1 = ov || (!relay1_in_startup && (uv || pl));
     bool volt_trip2 = ov || (!relay2_in_startup && (uv || pl));
 
-    if (volt_trip1 && relay1)
+    /* Hold: fault must persist for VOLT_TRIP_HOLD_S consecutive 1-s samples.
+     * Avoids nuisance trips from momentary dips or meter glitches. */
+    if (volt_trip1) { if (volt_trip_count1 < VOLT_TRIP_HOLD_S) volt_trip_count1++; }
+    else            { volt_trip_count1 = 0U; }
+    if (volt_trip2) { if (volt_trip_count2 < VOLT_TRIP_HOLD_S) volt_trip_count2++; }
+    else            { volt_trip_count2 = 0U; }
+
+    if (volt_trip_count1 >= VOLT_TRIP_HOLD_S && relay1)
     {
         Relay1_Set(false);
         /* Mark UV/PL trip for auto-restart — OV is dangerous, never auto-restart */
@@ -758,7 +988,7 @@ static void run_protection(void)
         Debug_Print("[PROT] Voltage fault — pump1 OFF\r\n");
     }
 
-    if (volt_trip2 && relay2)
+    if (volt_trip_count2 >= VOLT_TRIP_HOLD_S && relay2)
     {
         Relay2_Set(false);
         if (!ov) { uv_pl_tripped2 = true; uv_cleared_ms2 = 0; }
@@ -851,10 +1081,15 @@ static void run_protection(void)
         }
     }
 
+    /* Freeze dry-run and overload counters when meter has no recent valid data.
+     * Stale readings could cause a false trip; resetting the counter means the
+     * N-second dry-run window only counts from the next meter-online sample.  */
+    bool meter_stale = Modbus_IsStale();
+
     /* relay1_in_startup already computed above (shared grace window for voltage + dry-run) */
-    if (relay1_in_startup)
+    if (relay1_in_startup || meter_stale)
     {
-        dry_run_count = 0; /* keep counter clear during startup grace */
+        dry_run_count = 0; /* keep counter clear during startup grace or meter outage */
     }
     else if (relay1 && !dry_run_tripped && cfg_dry_en)
     {
@@ -863,7 +1098,7 @@ static void run_protection(void)
         if (i >= DRY_RUN_MIN_I_A && i < cfg_dry_i)
         {
             dry_run_count++;
-            if (dry_run_count >= (uint8_t)cfg_dry_t)
+            if (dry_run_count >= (uint16_t)cfg_dry_t)
             {
                 dry_run_tripped = true;
                 lockout_until = HAL_GetTick() + LOCKOUT_MS;
@@ -889,7 +1124,7 @@ static void run_protection(void)
 
     /* ── Relay2 dry run protection ─────────────────────────────────────── */
     /* relay2_in_startup already computed above (shared grace window for voltage + dry-run) */
-    if (relay2_in_startup)
+    if (relay2_in_startup || meter_stale)
     {
         dry_run_count2 = 0;
     }
@@ -898,7 +1133,7 @@ static void run_protection(void)
         if (i >= DRY_RUN_MIN_I_A && i < cfg_dry_i2)
         {
             dry_run_count2++;
-            if (dry_run_count2 >= (uint8_t)cfg_dry_t2)
+            if (dry_run_count2 >= (uint16_t)cfg_dry_t2)
             {
                 dry_run_tripped2 = true;
                 lockout_until2 = HAL_GetTick() + LOCKOUT_MS;
@@ -920,6 +1155,46 @@ static void run_protection(void)
         dry_run_count2 = 0;
         publish_alert2(false, false, false, false);
         Debug_Print("[PROT] Lockout2 cleared\r\n");
+    }
+
+    /* ── HP-based overload protection ───────────────────────────────────────
+     * Trip the relay after 3 consecutive 1-s samples with current exceeding
+     * 150% of the rated HP current at 415 V 3-phase.  Meter must be fresh.
+     * Relay OFF clears the tripped flag so a manual restart is allowed.     */
+    if (!meter_stale) {
+        float olim1 = overload_limit_for_hp(cfg_hp);
+        if (olim1 > 0.0f && relay1 && !overload_tripped1 && !relay1_in_startup) {
+            if (i > olim1) {
+                if (++overload_count1 >= 3U) {
+                    overload_tripped1 = true;
+                    overload_count1   = 0;
+                    Relay1_Set(false);
+                    log_relay_event(1, false, "overload");
+                    publish_alert(false, false, false, false);
+                    Debug_Print("[PROT] Overload — pump1 OFF\r\n");
+                }
+            } else {
+                overload_count1 = 0;
+            }
+        }
+        if (!relay1) { overload_tripped1 = false; overload_count1 = 0; }
+
+        float olim2 = overload_limit_for_hp(cfg_hp2);
+        if (olim2 > 0.0f && relay2 && !overload_tripped2 && !relay2_in_startup) {
+            if (i > olim2) {
+                if (++overload_count2 >= 3U) {
+                    overload_tripped2 = true;
+                    overload_count2   = 0;
+                    Relay2_Set(false);
+                    log_relay_event(2, false, "overload");
+                    publish_alert2(false, false, false, false);
+                    Debug_Print("[PROT] Overload — pump2 OFF\r\n");
+                }
+            } else {
+                overload_count2 = 0;
+            }
+        }
+        if (!relay2) { overload_tripped2 = false; overload_count2 = 0; }
     }
 
     /* Publish immediately when running state changes (relay ON + current confirmed).
@@ -1152,20 +1427,139 @@ static void RelayState_Load(void)
     Debug_Print("[CFG] Relay state restored from Flash\r\n");
 }
 
+/* ── Settings flash persistence (Flash page 62 = 0x0801F000, 2 KB) ──────────
+ * Settings are saved every time apply_settings() / apply_settings2() runs.
+ * On boot Settings_Load() restores them so protection uses the last Firebase
+ * values even before the MQTT broker re-delivers the settings topic.
+ * Page layout: 64 bytes = 8 doublewords, CRC32 over the first 60 bytes.    */
+#define SETTINGS_FLASH_ADDR  0x0801F000UL
+#define SETTINGS_PAGE        62U
+#define SETTINGS_MAGIC       0xBEEF0001UL
+
+typedef struct {
+    uint32_t magic;
+    float    ov, uv, pl, dry_i;            /* relay1 voltage + dry-run float settings */
+    int32_t  dry_t, hp, dry_en, start_t, uv_rst; /* relay1 int settings */
+    float    dry_i2;                        /* relay2 dry-run threshold */
+    int32_t  dry_t2, hp2, dry_en2, start_t2; /* relay2 int settings */
+    uint32_t crc;                           /* CRC32 over all fields above */
+} SettingsBlock_t;
+_Static_assert(sizeof(SettingsBlock_t) == 64U, "SettingsBlock_t must be 64 bytes");
+
+static uint32_t settings_crc32(const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t crc = 0xFFFFFFFFUL;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320UL & (uint32_t)(-(int32_t)(crc & 1U)));
+    }
+    return ~crc;
+}
+
+static void Settings_Load(void)
+{
+    const SettingsBlock_t *p = (const SettingsBlock_t *)SETTINGS_FLASH_ADDR;
+    if (p->magic != SETTINGS_MAGIC) {
+        Debug_Print("[CFG] No saved settings — using defaults\r\n");
+        return;
+    }
+    uint32_t expected = settings_crc32(p, sizeof(*p) - sizeof(p->crc));
+    if (expected != p->crc) {
+        Debug_Print("[CFG] Settings CRC mismatch — using defaults\r\n");
+        return;
+    }
+    cfg_ov           = p->ov;
+    cfg_uv           = p->uv;
+    cfg_pl           = p->pl;
+    cfg_dry_i        = p->dry_i;
+    cfg_dry_t        = (int)p->dry_t;
+    cfg_hp           = (int)p->hp;
+    cfg_dry_en       = (int)p->dry_en;
+    cfg_start_t      = (int)p->start_t;
+    cfg_uv_restart_t = (int)p->uv_rst;
+    cfg_dry_i2       = p->dry_i2;
+    cfg_dry_t2       = (int)p->dry_t2;
+    cfg_hp2          = (int)p->hp2;
+    cfg_dry_en2      = (int)p->dry_en2;
+    cfg_start_t2     = (int)p->start_t2;
+    Debug_Print("[CFG] Settings restored from flash\r\n");
+}
+
+static void Settings_Save(void)
+{
+    SettingsBlock_t blk;
+    blk.magic    = SETTINGS_MAGIC;
+    blk.ov       = cfg_ov;
+    blk.uv       = cfg_uv;
+    blk.pl       = cfg_pl;
+    blk.dry_i    = cfg_dry_i;
+    blk.dry_t    = (int32_t)cfg_dry_t;
+    blk.hp       = (int32_t)cfg_hp;
+    blk.dry_en   = (int32_t)cfg_dry_en;
+    blk.start_t  = (int32_t)cfg_start_t;
+    blk.uv_rst   = (int32_t)cfg_uv_restart_t;
+    blk.dry_i2   = cfg_dry_i2;
+    blk.dry_t2   = (int32_t)cfg_dry_t2;
+    blk.hp2      = (int32_t)cfg_hp2;
+    blk.dry_en2  = (int32_t)cfg_dry_en2;
+    blk.start_t2 = (int32_t)cfg_start_t2;
+    blk.crc      = settings_crc32(&blk, sizeof(blk) - sizeof(blk.crc));
+
+    HAL_FLASH_Unlock();
+    FLASH_EraseInitTypeDef erase = {
+        .TypeErase = FLASH_TYPEERASE_PAGES,
+        .Page      = SETTINGS_PAGE,
+        .NbPages   = 1,
+    };
+    uint32_t page_err = 0;
+    HAL_FLASHEx_Erase(&erase, &page_err);
+
+    uint64_t buf[sizeof(blk) / 8];
+    memcpy(buf, &blk, sizeof(blk));
+    for (size_t i = 0; i < sizeof(buf) / sizeof(buf[0]); i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SETTINGS_FLASH_ADDR + i * 8U, buf[i]);
+
+    HAL_FLASH_Lock();
+    Debug_Print("[CFG] Settings saved to flash\r\n");
+}
+
 /* Apply protection settings from JSON payload */
 static void apply_settings(const char *json)
 {
     float v;
     int   t;
-    v = extract_float(json, "ov",    cfg_ov);    if (v > 0.0f) cfg_ov    = v;
-    v = extract_float(json, "uv",    cfg_uv);    if (v > 0.0f) cfg_uv    = v;
-    v = extract_float(json, "pl",    cfg_pl);    if (v > 0.0f) cfg_pl    = v;
-    v = extract_float(json, "dry_i", cfg_dry_i); if (v > 0.0f) cfg_dry_i = v;
-    t = extract_int(json, "dry_t");              if (t > 0)    cfg_dry_t = t;
-    t = extract_int(json, "hp");                 if (t > 0)    cfg_hp     = t;
-    if (strstr(json, "\"dry_en\":"))             cfg_dry_en = extract_int(json, "dry_en") ? 1 : 0;
-    t = extract_int(json, "start_t");            if (t > 0)    cfg_start_t = t;
-    if (strstr(json, "\"uv_rst\":"))            { t = extract_int(json, "uv_rst"); if (t >= 0) cfg_uv_restart_t = t; }
+    /* Validated ranges prevent corrupt/typo payloads from disabling protection */
+    v = extract_float(json, "ov",    cfg_ov);
+    if (v >= 350.0f && v <= 550.0f) cfg_ov = v;
+
+    v = extract_float(json, "uv",    cfg_uv);
+    if (v >= 150.0f && v <= 430.0f) cfg_uv = v;
+
+    v = extract_float(json, "pl",    cfg_pl);
+    if (v >= 50.0f  && v <= 350.0f) cfg_pl = v;
+
+    v = extract_float(json, "dry_i", cfg_dry_i);
+    if (v >= 0.5f   && v <= 20.0f)  cfg_dry_i = v;
+
+    t = extract_int(json, "dry_t");
+    if (t >= 1 && t <= 600) cfg_dry_t = t;
+
+    t = extract_int(json, "hp");
+    if (t == 0 || t == 5 || t == 75) cfg_hp = t;
+
+    if (strstr(json, "\"dry_en\":"))
+        cfg_dry_en = extract_int(json, "dry_en") ? 1 : 0;
+
+    t = extract_int(json, "start_t");
+    if (t >= 1 && t <= 3600) cfg_start_t = t;
+
+    if (strstr(json, "\"uv_rst\":")) {
+        t = extract_int(json, "uv_rst");
+        if (t >= 0 && t <= 3600) cfg_uv_restart_t = t;
+    }
+    Settings_Save();
     Debug_Print("[CFG] Settings updated\r\n");
     publish_status(); /* reflect new cfg_ values immediately — don't wait for next heartbeat */
 }
@@ -1175,11 +1569,22 @@ static void apply_settings2(const char *json)
 {
     float v;
     int   t;
-    v = extract_float(json, "dry_i", cfg_dry_i2); if (v > 0.0f) cfg_dry_i2 = v;
-    t = extract_int(json, "dry_t");               if (t > 0)    cfg_dry_t2 = t;
-    t = extract_int(json, "hp");                  if (t > 0)    cfg_hp2    = t;
-    if (strstr(json, "\"dry_en\":"))              cfg_dry_en2 = extract_int(json, "dry_en") ? 1 : 0;
-    t = extract_int(json, "start_t");             if (t > 0)    cfg_start_t2 = t;
+    v = extract_float(json, "dry_i", cfg_dry_i2);
+    if (v >= 0.5f && v <= 20.0f) cfg_dry_i2 = v;
+
+    t = extract_int(json, "dry_t");
+    if (t >= 1 && t <= 600) cfg_dry_t2 = t;
+
+    t = extract_int(json, "hp");
+    if (t == 0 || t == 5 || t == 75) cfg_hp2 = t;
+
+    if (strstr(json, "\"dry_en\":"))
+        cfg_dry_en2 = extract_int(json, "dry_en") ? 1 : 0;
+
+    t = extract_int(json, "start_t");
+    if (t >= 1 && t <= 3600) cfg_start_t2 = t;
+
+    Settings_Save();
     Debug_Print("[CFG] Settings2 updated\r\n");
     publish_status(); /* cfg_dry_en2 is in pump01 status — publish immediately */
 }
@@ -1467,6 +1872,15 @@ static void process_line(const char *line)
     /* Case: payload arrived on line following +QMTRECV header */
     if (recv_payload_pending)
     {
+        /* Plain-text RESET command */
+        if (strcmp(line, "RESET") == 0) {
+            recv_payload_pending = false;
+            recv_pending_topic[0] = '\0';
+            Debug_Print("[CMD] MQTT reset — rebooting\r\n");
+            bkup_clear_reset_count();
+            IWDG->KR = 0xAAAAU;
+            NVIC_SystemReset();
+        }
         const char *json = strchr(line, '{');
         if (json)
         {
@@ -1701,6 +2115,14 @@ static void process_line(const char *line)
             {
                 modem_ota_start(ota_url, 0);
                 return;
+            }
+            /* Plain-text RESET on cmd topic */
+            if ((strstr(line, TOPIC_CMD) || strstr(line, TOPIC_CMD2)) &&
+                strstr(line, "RESET")) {
+                Debug_Print("[CMD] MQTT reset — rebooting\r\n");
+                bkup_clear_reset_count();
+                IWDG->KR = 0xAAAAU;
+                NVIC_SystemReset();
             }
         }
         if (strchr(line, '"'))
@@ -2111,8 +2533,12 @@ static void process_line(const char *line)
             prev_dry_run_trip = dry_run_tripped;
             last_heartbeat_ms = HAL_GetTick();
             modem_cmd("AT+CSQ"); /* seed rssi before first publish */
+            /* Seed line2 tracking so state changes are detected relative to current state */
+            prev_lora_r3_pub  = LoRa_GetRelay3State();
+            prev_slave_online = false; /* force online/offline alert on first pass */
             publish_status();
             pub_status2_needed = true; /* deferred — queue busy after publish_status() */
+            pub_line2_needed   = true; /* publish line2 status on connect              */
         }
         break;
 
@@ -2599,6 +3025,23 @@ static void modem_ota_start(const char *url, uint32_t expected_crc32)
     mqtt_state = MQTT_STATE_DISCONNECTED;
     HAL_IWDG_Refresh(&hiwdg);
 
+    /* Switch to 9600 baud for reliable OTA binary streaming.
+     * At 115200: ~11.5 bytes arrive per 1ms flash write → FIFO overflows → CRC mismatch.
+     * At   9600: ~0.96 bytes per 1ms flash write → no overflow → reliable stream.
+     * AT+IPR=115200 in OTA_ST_REBOOT restores EC200U baud before STM32 reset.
+     * MX_USART1_UART_Init() in the new firmware restores STM32 UART to 115200. */
+    modem_cmd("AT+IPR=9600");
+    if (modem_sync_expect("OK", 3000)) {
+        HAL_Delay(50);
+        modem_uart->Init.BaudRate = 9600;
+        HAL_UART_Init(modem_uart);
+        HAL_Delay(50);
+        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+        Debug_Print("[OTA] UART switched to 9600 baud\r\n");
+    } else {
+        Debug_Print("[OTA] WARN: AT+IPR=9600 failed — streaming at 115200\r\n");
+    }
+
     /* URL + HTTP config are already set above; start directly from GET. */
     OTA_SetExpectedCRC(expected_crc32);
     OTA_StartFromGet(url);
@@ -2657,6 +3100,10 @@ void Modem_Init(UART_HandleTypeDef *huart)
     /* Restore relay state from Flash before anything else — ensures latching
      * relays are driven to match their last known position on every reboot. */
     RelayState_Load();
+
+    /* Restore protection settings from Flash so correct thresholds are active
+     * from the first protection cycle, before Firebase re-delivers settings. */
+    Settings_Load();
 
     Debug_Print("\r\n=== EC200U MQTT Pump Controller ===\r\n");
     Debug_Print("[MODEM] Pump ID : " PUMP_ID "\r\n");
@@ -2993,6 +3440,8 @@ void Modem_Process(void)
         recv_payload_pending   = false;
         pub_pending            = false;
         pub_status2_needed     = false;
+        pub_line2_needed       = false;
+        pub_vlog2_needed       = false;
         mqtt_offline_since_ms  = 0; /* fresh 5-min window after each reinit */
         OTA_Init();
         Modem_Init(modem_uart);
@@ -3101,6 +3550,20 @@ void Modem_Process(void)
             publish_status2();
         }
 
+        /* Deferred line2 status (after keepalive or relay/online transition) */
+        if (pub_line2_needed && !pub_pending)
+        {
+            pub_line2_needed = false;
+            publish_line2_status();
+        }
+
+        /* Deferred pump2 voltage log (same data as pump1, just different topic) */
+        if (pub_vlog2_needed && !pub_pending)
+        {
+            pub_vlog2_needed = false;
+            publish_vlog_for(TOPIC_VLOG2);
+        }
+
         /* publish on state change — relay or dry-run trip changed */
         if (!pub_pending &&
             (relay1 != prev_relay1 || relay2 != prev_relay2 ||
@@ -3114,81 +3577,77 @@ void Modem_Process(void)
             if (relay2_changed) pub_status2_needed = true; /* deferred — queue busy */
         }
 
-        /* heartbeat every 60 s — keeps Firebase online:true fresh */
-        if (HAL_GetTick() - last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS)
+        /* 10-min keepalive — online:true for all pumps */
+        if (HAL_GetTick() - last_heartbeat_ms >= STATUS_KEEPALIVE_MS)
         {
             last_heartbeat_ms = HAL_GetTick();
             modem_cmd("AT+CSQ"); /* refresh signal strength; +CSQ updates last_rssi */
             publish_status();
-            pub_status2_needed = true; /* deferred — queue busy after publish_status() */
+            pub_status2_needed = true;  /* deferred — queue busy after publish_status() */
+            pub_line2_needed   = true;  /* deferred — line2 keepalive after line1       */
         }
 
-        /* LoRa slave_status — set() every 60 s (online or offline) */
-        if (HAL_GetTick() - lora_log_last_ms >= LORA_LOG_INTERVAL_MS)
+        /* Event-driven line2: publish immediately on relay3 state change */
+        if (!pub_pending)
         {
-            lora_log_last_ms = HAL_GetTick();
-            uint32_t age_raw = LoRa_GetLastRcvAge();
-            uint64_t ts      = Modem_GetUnixMs();
-
-            if (age_raw == 0xFFFFFFFFUL || age_raw / 1000 > 120)
+            int cur_r3 = LoRa_GetRelay3State();
+            if (cur_r3 != prev_lora_r3_pub && cur_r3 != -1)
             {
-                /* Slave offline — publish minimal offline status */
-                char off_st[48];
+                prev_lora_r3_pub = cur_r3;
+                publish_line2_status();
+            }
+        }
+
+        /* Event-driven line2: alert + status on slave online/offline transition */
+        if (!pub_pending)
+        {
+            uint32_t age_raw  = LoRa_GetLastRcvAge();
+            bool slave_now    = !(age_raw == 0xFFFFFFFFUL || age_raw / 1000U > 120U);
+            if (slave_now != prev_slave_online)
+            {
+                prev_slave_online = slave_now;
+                uint64_t ts = Modem_GetUnixMs();
+                char alert[72];
                 if (ts)
-                    snprintf(off_st, sizeof(off_st),
-                             "{\"online\":false,\"ts\":%llu}", (unsigned long long)ts);
+                    snprintf(alert, sizeof(alert),
+                             "{\"event\":\"%s\",\"ts\":%llu}",
+                             slave_now ? "slave_online" : "slave_offline",
+                             (unsigned long long)ts);
                 else
-                    snprintf(off_st, sizeof(off_st), "{\"online\":false}");
-                queue_publish(TOPIC_SLAVE_STATUS, off_st);
-            }
-            else
-            {
-                /* Slave online — build full status */
-                uint32_t age_s  = age_raw / 1000;
-                uint32_t fl_x10 = LoRa_GetFlowLpmX10();
-                uint32_t tv_l   = LoRa_GetTotalLitresInt();
-                char slave_st[320];
-                int slen = snprintf(slave_st, sizeof(slave_st),
-                             "{\"online\":true,\"relay\":%d"
-                             ",\"rssi\":%d,\"snr\":%d,\"age_s\":%lu"
-                             ",\"fl\":%lu.%lu,\"tv\":%lu",
-                             (LoRa_GetRelay3State() == 1) ? 1 : 0,
-                             LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                             (unsigned long)age_s,
-                             (unsigned long)(fl_x10 / 10U),
-                             (unsigned long)(fl_x10 % 10U),
-                             (unsigned long)tv_l);
-                if (LoRa_IsModbusValid() && slen > 0 && slen < (int)sizeof(slave_st) - 120)
-                    slen += snprintf(slave_st + slen, sizeof(slave_st) - (size_t)slen,
-                             ",\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
-                             ",\"i1\":%ld.%02ld,\"i2\":%ld.%02ld,\"i3\":%ld.%02ld"
-                             ",\"kw\":%ld.%ld,\"kwh\":%lu",
-                             (long)(LoRa_GetV1x10()  / 10), (long)(LoRa_GetV1x10()  % 10),
-                             (long)(LoRa_GetV2x10()  / 10), (long)(LoRa_GetV2x10()  % 10),
-                             (long)(LoRa_GetV3x10()  / 10), (long)(LoRa_GetV3x10()  % 10),
-                             (long)(LoRa_GetI1x100() / 100),(long)(LoRa_GetI1x100() % 100),
-                             (long)(LoRa_GetI2x100() / 100),(long)(LoRa_GetI2x100() % 100),
-                             (long)(LoRa_GetI3x100() / 100),(long)(LoRa_GetI3x100() % 100),
-                             (long)(LoRa_GetKWx10()  / 10), (long)(LoRa_GetKWx10()  % 10),
-                             (unsigned long)LoRa_GetKWh());
-                if (ts && slen > 0 && slen < (int)sizeof(slave_st) - 25)
-                    snprintf(slave_st + slen, sizeof(slave_st) - (size_t)slen,
-                             ",\"ts\":%llu}", (unsigned long long)ts);
-                else if (slen > 0 && slen < (int)sizeof(slave_st) - 2)
-                    slave_st[slen] = '}', slave_st[slen + 1] = '\0';
-                queue_publish(TOPIC_SLAVE_STATUS, slave_st);
+                    snprintf(alert, sizeof(alert),
+                             "{\"event\":\"%s\"}",
+                             slave_now ? "slave_online" : "slave_offline");
+                queue_publish(TOPIC_LINE2_ALERTS, alert);
+                pub_line2_needed = true; /* update status on transition */
             }
         }
 
-        /* LoRa slave voltage log — push every 5 min when Modbus valid */
-        static uint32_t slave_vlog_last_ms = 0;
-        if (HAL_GetTick() - slave_vlog_last_ms >= 300000U && LoRa_IsModbusValid())
+        /* 5-min voltage log for line1/pump1 and line1/pump2 (push) */
+        static uint32_t vlog_last_ms = 0;
+        if (HAL_GetTick() - vlog_last_ms >= VLOG_INTERVAL_MS)
         {
-            slave_vlog_last_ms = HAL_GetTick();
-            uint64_t ts = Modem_GetUnixMs();
-            char slave_vl[192];
-            int vlen = snprintf(slave_vl, sizeof(slave_vl),
-                         "{\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
+            vlog_last_ms = HAL_GetTick();
+            publish_vlog(); /* → TOPIC_VLOG; TOPIC_VLOG2 deferred via pub_vlog2_needed */
+        }
+
+        /* 5-min combined log for line2 (relay + flow + Modbus readings) */
+        static uint32_t line2_log_last_ms = 0;
+        if (HAL_GetTick() - line2_log_last_ms >= VLOG_INTERVAL_MS)
+        {
+            line2_log_last_ms = HAL_GetTick();
+            uint32_t fl_x10 = LoRa_GetFlowLpmX10();
+            uint32_t tv_l   = LoRa_GetTotalLitresInt();
+            uint64_t ts     = Modem_GetUnixMs();
+            char l2log[280];
+            int llen = snprintf(l2log, sizeof(l2log),
+                         "{\"relay\":%d,\"fl\":%lu.%lu,\"tv\":%lu",
+                         (LoRa_GetRelay3State() == 1) ? 1 : 0,
+                         (unsigned long)(fl_x10 / 10U),
+                         (unsigned long)(fl_x10 % 10U),
+                         (unsigned long)tv_l);
+            if (LoRa_IsModbusValid() && llen > 0 && llen < (int)sizeof(l2log) - 120)
+                llen += snprintf(l2log + llen, sizeof(l2log) - (size_t)llen,
+                         ",\"v1\":%ld.%ld,\"v2\":%ld.%ld,\"v3\":%ld.%ld"
                          ",\"i1\":%ld.%02ld,\"i2\":%ld.%02ld,\"i3\":%ld.%02ld"
                          ",\"kw\":%ld.%ld",
                          (long)(LoRa_GetV1x10()  / 10), (long)(LoRa_GetV1x10()  % 10),
@@ -3198,12 +3657,12 @@ void Modem_Process(void)
                          (long)(LoRa_GetI2x100() / 100),(long)(LoRa_GetI2x100() % 100),
                          (long)(LoRa_GetI3x100() / 100),(long)(LoRa_GetI3x100() % 100),
                          (long)(LoRa_GetKWx10()  / 10), (long)(LoRa_GetKWx10()  % 10));
-            if (ts && vlen > 0 && vlen < (int)sizeof(slave_vl) - 25)
-                snprintf(slave_vl + vlen, sizeof(slave_vl) - (size_t)vlen,
+            if (ts && llen > 0 && llen < (int)sizeof(l2log) - 25)
+                snprintf(l2log + llen, sizeof(l2log) - (size_t)llen,
                          ",\"ts\":%llu}", (unsigned long long)ts);
-            else if (vlen > 0 && vlen < (int)sizeof(slave_vl) - 2)
-                slave_vl[vlen] = '}', slave_vl[vlen + 1] = '\0';
-            queue_publish(TOPIC_SLAVE_VLOG, slave_vl);
+            else if (llen > 0 && llen < (int)sizeof(l2log) - 2)
+                l2log[llen] = '}', l2log[llen + 1] = '\0';
+            queue_publish(TOPIC_LINE2_LOG, l2log);
         }
 
         /* run protection every 1 s */
@@ -3458,8 +3917,8 @@ void Modem_Process(void)
                 bool r2 = (noinit_offline_relay2 != 0U);
                 noinit_offline_magic = 0U;          /* clear saved state     */
                 Debug_Print("[MQTT] online — restoring relay states\r\n");
-                if (r1) { Relay1_Set(true);  relay1_on_tick = HAL_GetTick(); }
-                if (r2) { Relay2_Set(true);  relay2_on_tick = HAL_GetTick(); }
+                if (r1 && !mains_is_off) { Relay1_Set(true);  relay1_on_tick = HAL_GetTick(); }
+                if (r2 && !mains_is_off) { Relay2_Set(true);  relay2_on_tick = HAL_GetTick(); }
                 RelayState_Save();                  /* update Flash          */
             }
         }
