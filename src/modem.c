@@ -193,7 +193,7 @@ static uint16_t volt_trip_count2  = 0;
 
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[768];   /* must be >= largest payload (publish_status ~740 B) */
+static char pub_payload[800];   /* must be >= largest payload (publish_status ~765 B with pwr_off) */
 static bool pub_pending = false;
 /* Exact byte count sent in the last AT+QMTPUBEX command.
  * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
@@ -262,6 +262,8 @@ static bool mains_is_off         = false;
 static bool mains_restore_relay1 = false;
 static bool mains_restore_relay2 = false;
 static bool mains_restore_slave  = false;  /* Blue Pill slave relay restore intent */
+static uint32_t mains_off_tick    = 0;     /* HAL_GetTick() when mains went OFF    */
+static uint64_t mains_off_unix_ms = 0;     /* Modem_GetUnixMs() when mains went OFF */
 
 static uint8_t mqtt_reset_count = 0; /* initialised from noinit RAM in Modem_Init */
 
@@ -731,7 +733,7 @@ static void publish_status(void)
     uint8_t  bat_pct = Battery_ReadPercent();  /* LiPo on PA0; 0xFF if read fails */
     uint32_t bat_mv  = Battery_ReadMv();       /* raw mV, e.g. 3820              */
 
-    char payload[740];
+    char payload[800];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
@@ -745,7 +747,7 @@ static void publish_status(void)
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
-             "\"cfg_uv_rst_t\":%d}",
+             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%llu}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
@@ -763,7 +765,8 @@ static void publish_status(void)
              scfg_ov, scfg_uv, scfg_pl,
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
-             cfg_uv_restart_t);
+             cfg_uv_restart_t,
+             (unsigned long long)(mains_is_off ? mains_off_unix_ms : 0ULL));
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -915,7 +918,9 @@ static void check_mains_state(void)
          * it but the coil pulse is a no-op (slave's 12V also absent). */
         LoRa_SendRelay(1, false);
 
-        mains_is_off = true;
+        mains_is_off      = true;
+        mains_off_tick    = HAL_GetTick();
+        mains_off_unix_ms = Modem_GetUnixMs();
         Debug_Print("[PWR] Mains OFF — state recorded (relay coil unpulseable, no 12V)\r\n");
     }
     else if (prev_dead && !all_dead) {
@@ -949,6 +954,27 @@ static void check_mains_state(void)
         /* Restore slave (Blue Pill) relay — 12V now available at slave too.
          * P1:ON or P1:OFF as appropriate; redundant coil pulses on latching relay are harmless. */
         LoRa_SendRelay(1, mains_restore_slave);
+
+        /* Publish outage duration to log so Flutter app can display daily history */
+        {
+            uint32_t dur_s = mains_off_tick
+                ? (HAL_GetTick() - mains_off_tick) / 1000U : 0U;
+            uint64_t ts_ms = Modem_GetUnixMs();
+            char pwr_log[128];
+            if (ts_ms && mains_off_unix_ms)
+                snprintf(pwr_log, sizeof(pwr_log),
+                         "{\"event\":\"mains_restore\",\"duration_s\":%lu,"
+                         "\"off_ts\":%llu,\"ts\":%llu}",
+                         (unsigned long)dur_s,
+                         (unsigned long long)mains_off_unix_ms,
+                         (unsigned long long)ts_ms);
+            else
+                snprintf(pwr_log, sizeof(pwr_log),
+                         "{\"event\":\"mains_restore\",\"duration_s\":%lu}",
+                         (unsigned long)dur_s);
+            queue_publish(TOPIC_LOG, pwr_log);
+            mains_off_tick = 0; mains_off_unix_ms = 0;
+        }
         Debug_Print("[PWR] Mains ON — relays reset then correct pump restored\r\n");
     }
     prev_dead = all_dead;
