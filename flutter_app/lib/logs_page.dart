@@ -1,12 +1,413 @@
 // lib/logs_page.dart
 // Pump logs — Events tab (history list) + Charts tab (3 charts)
-// Charts data sources:
-//   pumps/{pumpId}/voltage_log/{key}: {ts, v1, v2, v3, current}  (5-min snapshots)
-//   pumps/{pumpId}/logs/{key}:        {event, reason, run_s, ts}
+// Charts data sources (new Firebase hierarchy):
+//   {pumpFbBase}/logs/{key}:   {ts, v1, v2, v3, i, kw, kwh}  (5-min vlog snapshots)
+//   {pumpFbBase}/alerts/{key}: {event, reason, run_s, ts}      (relay on/off events)
 
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:fl_chart/fl_chart.dart';
+
+// ─── Slave log entry (line2/logs) ─────────────────────────────────────────────
+class _SEntry {
+  final int    ts;
+  final double fl;   // L/min
+  final int    tv;   // total volume L
+  final int    dp;   // depth mm (-1 = no sensor)
+  final double v1, v2, v3;
+  final double i1, i2, i3;  // per-phase current (A) from Modbus
+  final double kw;
+  final int    kwh;
+
+  const _SEntry({
+    required this.ts, required this.fl, required this.tv, required this.dp,
+    required this.v1, required this.v2, required this.v3,
+    required this.i1, required this.i2, required this.i3,
+    required this.kw, required this.kwh,
+  });
+
+  factory _SEntry.fromMap(Map<Object?, Object?> m) {
+    // Normalize ts to ms: firmware sends Unix seconds, bridge fallback sends ms
+    final rawTs = (m['ts'] as num?)?.toInt() ?? 0;
+    final tsMs  = rawTs > 0 && rawTs < 10000000000 ? rawTs * 1000 : rawTs;
+    return _SEntry(
+    ts:  tsMs,
+    fl:  (m['fl']  as num?)?.toDouble() ?? 0,
+    tv:  (m['tv']  as num?)?.toInt()    ?? 0,
+    dp:  (m['dp']  as num?)?.toInt()    ?? -1,
+    v1:  (m['v1']  as num?)?.toDouble() ?? 0,
+    v2:  (m['v2']  as num?)?.toDouble() ?? 0,
+    v3:  (m['v3']  as num?)?.toDouble() ?? 0,
+    i1:  (m['i1']  as num?)?.toDouble() ?? 0,
+    i2:  (m['i2']  as num?)?.toDouble() ?? 0,
+    i3:  (m['i3']  as num?)?.toDouble() ?? 0,
+    kw:  (m['kw']  as num?)?.toDouble() ?? 0,
+    kwh: (m['kwh'] as num?)?.toInt()    ?? 0,
+  );
+}
+}
+
+// ─── Slave Logs Page ──────────────────────────────────────────────────────────
+class SlaveLogsPage extends StatefulWidget {
+  final String slaveFbPath;
+  const SlaveLogsPage({super.key, required this.slaveFbPath});
+
+  @override
+  State<SlaveLogsPage> createState() => _SlaveLogsPageState();
+}
+
+class _SlaveLogsPageState extends State<SlaveLogsPage>
+    with SingleTickerProviderStateMixin {
+  final _db = FirebaseDatabase.instance;
+  late TabController _tab;
+
+  List<_SEntry>              _log    = [];
+  List<Map<String, dynamic>> _events = [];
+  int  _windowStartMs = 0;
+  int  _dayOffset     = 0;
+  bool _loadingCharts = true;
+  bool _loadingEvents = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _tab = TabController(length: 2, vsync: this);
+    _loadCharts();
+    _loadEvents();
+  }
+
+  @override
+  void dispose() {
+    _tab.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadCharts() async {
+    if (!mounted) return;
+    setState(() => _loadingCharts = true);
+    await _loadLog();
+    if (mounted) setState(() => _loadingCharts = false);
+  }
+
+  Future<void> _loadLog() async {
+    final now      = DateTime.now();
+    final winStart = DateTime(now.year, now.month, now.day)
+        .subtract(Duration(days: _dayOffset));
+    _windowStartMs = winStart.millisecondsSinceEpoch;
+    final winEndMs  = _windowStartMs + 24 * 3600 * 1000;
+    final snap = await _db
+        .ref('${widget.slaveFbPath}/logs')
+        .orderByKey()
+        .limitToLast(1500)
+        .get();
+    final data = snap.value as Map?;
+    if (data == null) { _log = []; return; }
+    _log = data.entries
+        .map((e) => _SEntry.fromMap(e.value as Map<Object?, Object?>))
+        .where((e) => e.ts >= _windowStartMs && e.ts < winEndMs)
+        .toList()
+      ..sort((a, b) => a.ts.compareTo(b.ts));
+  }
+
+  Future<void> _loadEvents() async {
+    if (!mounted) return;
+    setState(() => _loadingEvents = true);
+    final snap = await _db
+        .ref('${widget.slaveFbPath}/alerts')
+        .orderByKey()
+        .limitToLast(60)
+        .get();
+    if (!mounted) return;
+    final data = snap.value as Map?;
+    if (data == null) {
+      setState(() { _events = []; _loadingEvents = false; });
+      return;
+    }
+    final entries = data.entries.toList()
+      ..sort((a, b) => b.key.toString().compareTo(a.key.toString()));
+    setState(() {
+      _events = entries
+          .map((e) => Map<String, dynamic>.from(e.value as Map))
+          .toList();
+      _loadingEvents = false;
+    });
+  }
+
+  Future<void> _changeDay(int offset) async {
+    if (!mounted || _dayOffset == offset) return;
+    setState(() { _dayOffset = offset; _loadingCharts = true; });
+    await _loadLog();
+    if (mounted) setState(() => _loadingCharts = false);
+  }
+
+  void _refresh() { _loadCharts(); _loadEvents(); }
+
+  // ── Time-axis helpers ──────────────────────────────────────────────────────
+  double _xFor(_SEntry e) => (e.ts - _windowStartMs) / 60000.0;
+
+  Widget _timeLabel(double v, TitleMeta _) {
+    final totalMin = v.round() % (24 * 60);
+    final h = totalMin ~/ 60;
+    final m = totalMin % 60;
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Text('${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}',
+          style: const TextStyle(fontSize: 8)),
+    );
+  }
+
+  String _xToTime(double x) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(
+        _windowStartMs + (x * 60000).round()).toLocal();
+    return '${dt.day.toString().padLeft(2,'0')}/${dt.month.toString().padLeft(2,'0')}'
+           ' ${dt.hour.toString().padLeft(2,'0')}:${dt.minute.toString().padLeft(2,'0')}';
+  }
+
+  FlTitlesData _timeTitles({
+    required Widget Function(double, TitleMeta) leftWidget,
+    double leftReserved = 36,
+  }) => FlTitlesData(
+    leftTitles: AxisTitles(sideTitles: SideTitles(
+      showTitles: true, reservedSize: leftReserved, getTitlesWidget: leftWidget)),
+    bottomTitles: AxisTitles(sideTitles: SideTitles(
+      showTitles: true, reservedSize: 26, interval: 360, getTitlesWidget: _timeLabel)),
+    rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+    topTitles:   AxisTitles(sideTitles: SideTitles(showTitles: false)),
+  );
+
+  Widget _emptyChart(String msg) => SizedBox(
+    height: 180,
+    child: Center(child: Text(msg, style: const TextStyle(color: Colors.grey))),
+  );
+
+  FlGridData get _grid => FlGridData(
+    show: true, drawVerticalLine: true, verticalInterval: 360,
+    getDrawingVerticalLine:   (_) => FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+    getDrawingHorizontalLine: (_) => FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+  );
+
+  // ── Chart: Flow Rate (L/min) ───────────────────────────────────────────────
+  Widget _buildFlowChart() {
+    if (_log.isEmpty) return _emptyChart('No data for selected day');
+    final spots = _log.map((e) => FlSpot(_xFor(e), e.fl)).toList();
+    final allFl = _log.map((e) => e.fl).where((v) => v > 0).toList();
+    final maxFl = allFl.isEmpty ? 20.0 : allFl.reduce((a, b) => a > b ? a : b) + 5;
+    return _ChartCard(
+      title: 'Flow Rate (L/min)',
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: 0, maxY: maxFl,
+        gridData: _grid, borderData: FlBorderData(show: false),
+        lineBarsData: [LineChartBarData(
+          spots: spots, color: Colors.blue.shade600,
+          isCurved: true, barWidth: 2,
+          dotData: const FlDotData(show: false),
+          belowBarData: BarAreaData(show: true,
+              color: Colors.blue.shade600.withValues(alpha: 0.12)),
+        )],
+        titlesData: _timeTitles(
+          leftWidget: (v, _) => Text(v.toStringAsFixed(0), style: const TextStyle(fontSize: 9))),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (s) => s.map((p) => LineTooltipItem(
+            '${_xToTime(p.x)}\n${p.y.toStringAsFixed(1)} L/min',
+            TextStyle(color: Colors.blue.shade300, fontSize: 11))).toList(),
+        )),
+      )),
+    );
+  }
+
+  // ── Chart: Water Depth (m) ─────────────────────────────────────────────────
+  Widget _buildDepthChart() {
+    final valid = _log.where((e) => e.dp >= 0).toList();
+    if (valid.isEmpty) return _emptyChart('No depth sensor data');
+    final spots = valid.map((e) => FlSpot(_xFor(e), e.dp / 1000.0)).toList();
+    final all   = valid.map((e) => e.dp / 1000.0).toList();
+    final maxDp = all.reduce((a, b) => a > b ? a : b) + 0.5;
+    return _ChartCard(
+      title: 'Water Depth (m)',
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: 0, maxY: maxDp,
+        gridData: _grid, borderData: FlBorderData(show: false),
+        lineBarsData: [LineChartBarData(
+          spots: spots, color: Colors.indigo.shade400,
+          isCurved: true, barWidth: 2,
+          dotData: const FlDotData(show: false),
+          belowBarData: BarAreaData(show: true,
+              color: Colors.indigo.shade400.withValues(alpha: 0.12)),
+        )],
+        titlesData: _timeTitles(
+          leftWidget: (v, _) => Text(v.toStringAsFixed(1), style: const TextStyle(fontSize: 9))),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (s) => s.map((p) => LineTooltipItem(
+            '${_xToTime(p.x)}\n${p.y.toStringAsFixed(2)} m',
+            TextStyle(color: Colors.indigo.shade300, fontSize: 11))).toList(),
+        )),
+      )),
+    );
+  }
+
+  // ── Chart: 3-Phase Voltage (only when energy meter data exists) ────────────
+  Widget _buildVoltageChart() {
+    final valid = _log.where((e) => e.v1 > 0 || e.v2 > 0 || e.v3 > 0).toList();
+    if (valid.isEmpty) return _emptyChart('No energy meter data');
+    final phaseColors = [Colors.red.shade500, Colors.green.shade600, Colors.blue.shade500];
+    List<FlSpot> ph(double Function(_SEntry) fn) =>
+        valid.map((e) => FlSpot(_xFor(e), fn(e))).toList();
+    final allV = valid.expand((e) => [e.v1, e.v2, e.v3]).where((v) => v > 0).toList();
+    final minV = allV.isEmpty ? 180.0 : allV.reduce((a, b) => a < b ? a : b) - 10;
+    final maxV = allV.isEmpty ? 260.0 : allV.reduce((a, b) => a > b ? a : b) + 10;
+    return _ChartCard(
+      title: '3-Phase Voltage (V)',
+      legend: Row(children: [
+        _LegendDot(color: phaseColors[0], label: 'L1'),
+        const SizedBox(width: 10),
+        _LegendDot(color: phaseColors[1], label: 'L2'),
+        const SizedBox(width: 10),
+        _LegendDot(color: phaseColors[2], label: 'L3'),
+      ]),
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: minV, maxY: maxV,
+        gridData: _grid, borderData: FlBorderData(show: false),
+        lineBarsData: [
+          LineChartBarData(spots: ph((e) => e.v1), color: phaseColors[0],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+          LineChartBarData(spots: ph((e) => e.v2), color: phaseColors[1],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+          LineChartBarData(spots: ph((e) => e.v3), color: phaseColors[2],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+        ],
+        titlesData: _timeTitles(
+          leftWidget: (v, _) => Text(v.toStringAsFixed(0), style: const TextStyle(fontSize: 9)),
+          leftReserved: 40),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (spots) {
+            const labels = ['L1', 'L2', 'L3'];
+            return spots.map((s) {
+              final idx = s.barIndex < 3 ? s.barIndex : 0;
+              return LineTooltipItem(
+                '${labels[idx]}: ${s.y.toStringAsFixed(0)} V\n${_xToTime(s.x)}',
+                TextStyle(color: phaseColors[idx], fontSize: 11));
+            }).toList();
+          },
+        )),
+      )),
+    );
+  }
+
+  // ── Day selector ───────────────────────────────────────────────────────────
+  String _dayLabel(int offset) {
+    if (offset == 0) return 'Today';
+    if (offset == 1) return 'Yesterday';
+    final day    = DateTime.now().subtract(Duration(days: offset));
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return '${day.day} ${months[day.month - 1]} ${day.year}';
+  }
+
+  Widget _buildDaySelector() => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+    child: Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        IconButton(
+          icon: const Icon(Icons.chevron_left), tooltip: 'Previous day',
+          onPressed: _dayOffset < 4 ? () => _changeDay(_dayOffset + 1) : null),
+        Row(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.calendar_today_outlined, size: 16, color: Colors.grey),
+          const SizedBox(width: 6),
+          Text(_dayLabel(_dayOffset),
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+        ]),
+        IconButton(
+          icon: const Icon(Icons.chevron_right), tooltip: 'Next day',
+          onPressed: _dayOffset > 0 ? () => _changeDay(_dayOffset - 1) : null),
+      ],
+    ),
+  );
+
+  // ── Tabs ───────────────────────────────────────────────────────────────────
+  Widget _buildChartsTab() => Column(children: [
+    _buildDaySelector(),
+    Expanded(
+      child: _loadingCharts
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+              child: Column(children: [
+                _buildFlowChart(),
+                const SizedBox(height: 12),
+                _buildDepthChart(),
+                const SizedBox(height: 12),
+                _buildVoltageChart(),
+                const SizedBox(height: 24),
+              ]),
+            ),
+    ),
+  ]);
+
+  String _formatTs(int tsMs) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(tsMs).toLocal();
+    return '${dt.day.toString().padLeft(2,'0')}/'
+           '${dt.month.toString().padLeft(2,'0')}'
+           '  ${dt.hour.toString().padLeft(2,'0')}:'
+           '${dt.minute.toString().padLeft(2,'0')}';
+  }
+
+  Widget _buildEventsTab() {
+    if (_loadingEvents) return const Center(child: CircularProgressIndicator());
+    if (_events.isEmpty) {
+      return const Center(child: Text('No events yet.', style: TextStyle(color: Colors.grey)));
+    }
+    return ListView.separated(
+      itemCount: _events.length,
+      separatorBuilder: (_, __) => const Divider(height: 1, indent: 56),
+      itemBuilder: (ctx, i) {
+        final e       = _events[i];
+        final event   = e['event'] as String? ?? '';
+        final ts      = (e['ts'] as num?)?.toInt() ?? 0;
+        final isOnline = event == 'online';
+        final color   = isOnline ? Colors.green : Colors.red;
+        return ListTile(
+          dense: true,
+          leading: CircleAvatar(
+            radius: 18,
+            backgroundColor: color.withValues(alpha: 0.12),
+            child: Icon(isOnline ? Icons.wifi : Icons.wifi_off, color: color, size: 20),
+          ),
+          title: Text(isOnline ? 'Slave Online' : 'Slave Offline',
+              style: TextStyle(fontWeight: FontWeight.w600,
+                  color: isOnline ? Colors.green.shade700 : Colors.red.shade700,
+                  fontSize: 13)),
+          trailing: ts > 0
+              ? Text(_formatTs(ts), style: const TextStyle(fontSize: 11, color: Colors.grey))
+              : null,
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Slave Logs'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _refresh),
+        ],
+        bottom: TabBar(
+          controller: _tab,
+          tabs: const [Tab(text: 'Charts'), Tab(text: 'Events')],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tab,
+        children: [_buildChartsTab(), _buildEventsTab()],
+      ),
+    );
+  }
+}
 
 // ─── Voltage log entry ────────────────────────────────────────────────────────
 class _VEntry {
@@ -16,6 +417,7 @@ class _VEntry {
   final double v3;
   final double current;
   final double kw;      // Total active power from meter (kW)
+  final double kwh;     // Meter's cumulative kWh counter (0 = not available / pre-firmware)
 
   const _VEntry({
     required this.ts,
@@ -24,6 +426,7 @@ class _VEntry {
     required this.v3,
     required this.current,
     required this.kw,
+    required this.kwh,
   });
 
   factory _VEntry.fromMap(Map<Object?, Object?> m) => _VEntry(
@@ -31,15 +434,18 @@ class _VEntry {
         v1:      (m['v1']      as num?)?.toDouble() ?? 0,
         v2:      (m['v2']      as num?)?.toDouble() ?? 0,
         v3:      (m['v3']      as num?)?.toDouble() ?? 0,
-        current: (m['current'] as num?)?.toDouble() ?? 0,
+        current: (m['i']       as num?)?.toDouble() ?? 0,  // firmware publishes "i", not "current"
         kw:      (m['kw']      as num?)?.toDouble() ?? 0,
+        kwh:     (m['kwh']     as num?)?.toDouble() ?? 0,  // cumulative meter counter (0 = absent)
       );
 }
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 class LogsPage extends StatefulWidget {
   final List<String> pumpIds;
-  const LogsPage({super.key, required this.pumpIds});
+  final List<String> pumpFbBases; // Firebase base paths, same order as pumpIds
+  final String? slaveFbPath;      // Line 2 slave path — enables Line 02 toggle
+  const LogsPage({super.key, required this.pumpIds, required this.pumpFbBases, this.slaveFbPath});
 
   @override
   State<LogsPage> createState() => _LogsPageState();
@@ -65,12 +471,25 @@ class _LogsPageState extends State<LogsPage>
   List<_VEntry> _allVlog = [];
   bool _loadingCharts = true;
 
+  // ── Line 2 (slave) charts state ──────────────────────────────────────────
+  List<_SEntry> _slog      = [];
+  int           _selectedLine = 1; // 1 = Line 01, 2 = Line 02
+  late PageController _pageCtrl;
+
+  // Map pumpId → Firebase base path using the parallel pumpFbBases list.
+  String _fbBaseFor(String pumpId) {
+    final idx = widget.pumpIds.indexOf(pumpId);
+    if (idx >= 0 && idx < widget.pumpFbBases.length) return widget.pumpFbBases[idx];
+    return widget.pumpFbBases.isNotEmpty ? widget.pumpFbBases.first : 'sites/site01/line01/pump01';
+  }
+
   // ── Lifecycle ───────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    _tab    = TabController(length: 2, vsync: this);
-    _pumpId = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
+    _tab      = TabController(length: 2, vsync: this);
+    _pageCtrl = PageController();
+    _pumpId   = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
     _loadLogs();
     _loadCharts();
   }
@@ -78,6 +497,7 @@ class _LogsPageState extends State<LogsPage>
   @override
   void dispose() {
     _tab.dispose();
+    _pageCtrl.dispose();
     super.dispose();
   }
 
@@ -87,7 +507,7 @@ class _LogsPageState extends State<LogsPage>
     if (!mounted) return;
     setState(() => _loadingLogs = true);
     final snap = await _db
-        .ref('pumps/$_pumpId/logs')
+        .ref('${_fbBaseFor(_pumpId)}/alerts')
         .orderByKey()
         .limitToLast(60)
         .get();
@@ -110,8 +530,25 @@ class _LogsPageState extends State<LogsPage>
   Future<void> _loadCharts() async {
     if (!mounted) return;
     setState(() => _loadingCharts = true);
-    await Future.wait([_loadVoltageLog(), _loadRuntime(), _loadPumpRuntime()]);
+    await Future.wait([_loadVoltageLog(), _loadRuntime(), _loadPumpRuntime(), _loadSlaveLog()]);
     if (mounted) setState(() => _loadingCharts = false);
+  }
+
+  Future<void> _loadSlaveLog() async {
+    if (widget.slaveFbPath == null) { _slog = []; return; }
+    final winEndMs = _windowStartMs + 24 * 3600 * 1000;
+    final snap = await _db
+        .ref('${widget.slaveFbPath}/logs')
+        .orderByKey()
+        .limitToLast(1500)
+        .get();
+    final data = snap.value as Map?;
+    if (data == null) { _slog = []; return; }
+    _slog = data.entries
+        .map((e) => _SEntry.fromMap(e.value as Map<Object?, Object?>))
+        .where((e) => e.ts >= _windowStartMs && e.ts < winEndMs)
+        .toList()
+      ..sort((a, b) => a.ts.compareTo(b.ts));
   }
 
   Future<void> _loadVoltageLog() async {
@@ -122,10 +559,10 @@ class _LogsPageState extends State<LogsPage>
     _windowStartMs = winStart.millisecondsSinceEpoch;
     final winEndMs  = _windowStartMs + 24 * 3600 * 1000;
 
-    final chartPump = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
+    final chartPump = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : '';
     // limitToLast(1500) covers up to 5 days of 5-min slots; filter client-side
     final snap = await _db
-        .ref('pumps/$chartPump/voltage_log')
+        .ref('${_fbBaseFor(chartPump)}/logs')
         .orderByKey()
         .limitToLast(1500)
         .get();
@@ -139,10 +576,10 @@ class _LogsPageState extends State<LogsPage>
   }
 
   Future<void> _loadRuntime() async {
-    // Fetch voltage_log for the peak-kW / kWh helpers (_windowPeakKw, _windowKwhTotal).
-    final deviceId = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
+    // Fetch vlog entries for the peak-kW / kWh helpers (_windowPeakKw, _windowKwhTotal).
+    final firstPump = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : '';
     final snap = await _db
-        .ref('pumps/$deviceId/voltage_log')
+        .ref('${_fbBaseFor(firstPump)}/logs')
         .orderByKey()
         .limitToLast(2016) // ~7 days × 288 slots/day (5-min interval)
         .get();
@@ -167,7 +604,7 @@ class _LogsPageState extends State<LogsPage>
     final Map<String, Map<String, int>> result = {};
     await Future.wait(widget.pumpIds.map((pumpId) async {
       final snap = await _db
-          .ref('pumps/$pumpId/logs')
+          .ref('${_fbBaseFor(pumpId)}/alerts')
           .orderByKey()
           .limitToLast(500)
           .get();
@@ -210,7 +647,7 @@ class _LogsPageState extends State<LogsPage>
   Future<void> _changeDay(int offset) async {
     if (!mounted || _dayOffset == offset) return;
     setState(() { _dayOffset = offset; _loadingCharts = true; });
-    await _loadVoltageLog();
+    await Future.wait([_loadVoltageLog(), _loadSlaveLog()]);
     if (mounted) setState(() => _loadingCharts = false);
   }
 
@@ -221,9 +658,9 @@ class _LogsPageState extends State<LogsPage>
 
   // ── Time-axis helpers ────────────────────────────────────────────────────────
 
-  // X value = minutes elapsed since the 6 AM window start
-  double _xFor(_VEntry e) =>
-      (e.ts - _windowStartMs) / 60000.0;
+  // X value = minutes elapsed since midnight of the selected day
+  double _xFor(_VEntry e) => (e.ts - _windowStartMs) / 60000.0;
+  double _xForS(_SEntry e) => (e.ts - _windowStartMs) / 60000.0;
 
   // Label for a given X (minutes since 6AM) → "HH:MM"
   Widget _timeLabel(double v, TitleMeta _) {
@@ -441,7 +878,7 @@ class _LogsPageState extends State<LogsPage>
   Widget _buildDailyRuntimeChart() {
     // Collect all day labels across all pumps
     final allDays = <String>{};
-    for (final pMap in _pumpRuntime.values) allDays.addAll(pMap.keys);
+    for (final pMap in _pumpRuntime.values) { allDays.addAll(pMap.keys); }
     final sortedDays = allDays.toList()..sort();
     final last7 = sortedDays.length > 7
         ? sortedDays.sublist(sortedDays.length - 7)
@@ -571,20 +1008,40 @@ class _LogsPageState extends State<LogsPage>
     return peak;
   }
 
-  // Total kWh for a 24-h window using actual time deltas between entries.
-  // Avoids inflating kWh when bridge restarts create extra entries at
-  // intervals shorter than 5 minutes.
+  // Total kWh for a 24-h window.
+  //
+  // Method 1 (preferred): meter counter delta — last.kwh minus first.kwh within the
+  // window, using the authoritative accumulator register from the Selec EM4M meter.
+  // This is exact even when the device was offline between readings (the meter keeps
+  // counting). Falls back to Method 2 if kwh data is absent (older firmware entries).
+  //
+  // Method 2 (fallback): trapezoidal kW integration. Uses average of adjacent kW
+  // readings × real time gap. Gaps > 30 min are skipped (device offline, pump likely
+  // not running, so we assume 0 consumption during the gap).
   double _windowKwhTotal(int winStartMs) {
     final winEndMs = winStartMs + 24 * 3600 * 1000;
+
+    // ── Method 1: meter counter delta ──────────────────────────────────────
+    final kwhEntries = _allVlog
+        .where((e) => e.ts > 0 && e.kwh > 0 && e.ts >= winStartMs && e.ts < winEndMs)
+        .toList()
+      ..sort((a, b) => a.ts.compareTo(b.ts));
+    if (kwhEntries.length >= 2) {
+      final delta = kwhEntries.last.kwh - kwhEntries.first.kwh;
+      if (delta >= 0) return delta; // normal: counter increased; use it directly
+      // delta < 0 would mean counter reset/rollover — fall through to integration
+    }
+
+    // ── Method 2: trapezoidal kW integration (fallback) ────────────────────
     final entries = _allVlog
-        .where((e) => e.ts >= winStartMs && e.ts < winEndMs)
+        .where((e) => e.ts > 0 && e.ts >= winStartMs && e.ts < winEndMs)
         .toList()
       ..sort((a, b) => a.ts.compareTo(b.ts));
     double total = 0;
     for (int i = 1; i < entries.length; i++) {
       final deltaH = (entries[i].ts - entries[i - 1].ts) / 3600000.0;
-      // Clamp to 10 min max to ignore gaps from device offline / bridge restart
-      total += entries[i - 1].kw * deltaH.clamp(0, 10 / 60.0);
+      if (deltaH > 0.5) continue; // skip gaps > 30 min (device offline)
+      total += (entries[i - 1].kw + entries[i].kw) / 2.0 * deltaH;
     }
     return total;
   }
@@ -714,6 +1171,199 @@ class _LogsPageState extends State<LogsPage>
     child: Center(child: Text(msg, style: const TextStyle(color: Colors.grey))),
   );
 
+  FlGridData get _stdGrid => FlGridData(
+    show: true, drawVerticalLine: true, verticalInterval: 360,
+    getDrawingVerticalLine:   (_) => FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+    getDrawingHorizontalLine: (_) => FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+  );
+
+  // ── Line 2 charts ─────────────────────────────────────────────────────────
+
+  Widget _buildSlaveFlowChart() {
+    if (_slog.isEmpty) return _emptyChart('No Line 2 data for selected day');
+    final spots = _slog.map((e) => FlSpot(_xForS(e), e.fl)).toList();
+    final allFl = _slog.map((e) => e.fl).where((v) => v > 0).toList();
+    final maxFl = allFl.isEmpty ? 20.0 : allFl.reduce((a, b) => a > b ? a : b) + 5;
+    return _ChartCard(
+      title: 'Flow Rate (L/min)',
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: 0, maxY: maxFl,
+        gridData: _stdGrid, borderData: FlBorderData(show: false),
+        lineBarsData: [LineChartBarData(
+          spots: spots, color: Colors.blue.shade600,
+          isCurved: true, barWidth: 2,
+          dotData: const FlDotData(show: false),
+          belowBarData: BarAreaData(show: true,
+              color: Colors.blue.shade600.withValues(alpha: 0.12)),
+        )],
+        titlesData: _timeTitles(leftWidget: (v, _) =>
+            Text(v.toStringAsFixed(0), style: const TextStyle(fontSize: 9))),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (s) => s.map((p) => LineTooltipItem(
+            '${_xToTime(p.x)}\n${p.y.toStringAsFixed(1)} L/min',
+            TextStyle(color: Colors.blue.shade300, fontSize: 11))).toList(),
+        )),
+      )),
+    );
+  }
+
+  Widget _buildSlaveDepthChart() {
+    final valid = _slog.where((e) => e.dp >= 0).toList();
+    if (valid.isEmpty) return _emptyChart('No depth sensor data');
+    final spots = valid.map((e) => FlSpot(_xForS(e), e.dp / 1000.0)).toList();
+    final all   = valid.map((e) => e.dp / 1000.0).toList();
+    final maxDp = all.reduce((a, b) => a > b ? a : b) + 0.5;
+    return _ChartCard(
+      title: 'Water Depth (m)',
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: 0, maxY: maxDp,
+        gridData: _stdGrid, borderData: FlBorderData(show: false),
+        lineBarsData: [LineChartBarData(
+          spots: spots, color: Colors.indigo.shade400,
+          isCurved: true, barWidth: 2,
+          dotData: const FlDotData(show: false),
+          belowBarData: BarAreaData(show: true,
+              color: Colors.indigo.shade400.withValues(alpha: 0.12)),
+        )],
+        titlesData: _timeTitles(leftWidget: (v, _) =>
+            Text(v.toStringAsFixed(1), style: const TextStyle(fontSize: 9))),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (s) => s.map((p) => LineTooltipItem(
+            '${_xToTime(p.x)}\n${p.y.toStringAsFixed(2)} m',
+            TextStyle(color: Colors.indigo.shade300, fontSize: 11))).toList(),
+        )),
+      )),
+    );
+  }
+
+  Widget _buildSlaveVoltageChart() {
+    final valid = _slog.where((e) => e.v1 > 0 || e.v2 > 0 || e.v3 > 0).toList();
+    if (valid.isEmpty) return _emptyChart('No energy meter data');
+    final phaseColors = [Colors.red.shade500, Colors.green.shade600, Colors.blue.shade500];
+    List<FlSpot> ph(double Function(_SEntry) fn) =>
+        valid.map((e) => FlSpot(_xForS(e), fn(e))).toList();
+    final allV = valid.expand((e) => [e.v1, e.v2, e.v3]).where((v) => v > 0).toList();
+    final minV = allV.isEmpty ? 180.0 : allV.reduce((a, b) => a < b ? a : b) - 10;
+    final maxV = allV.isEmpty ? 260.0 : allV.reduce((a, b) => a > b ? a : b) + 10;
+    return _ChartCard(
+      title: '3-Phase Voltage (V)',
+      legend: Row(children: [
+        _LegendDot(color: phaseColors[0], label: 'L1'),
+        const SizedBox(width: 10),
+        _LegendDot(color: phaseColors[1], label: 'L2'),
+        const SizedBox(width: 10),
+        _LegendDot(color: phaseColors[2], label: 'L3'),
+      ]),
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: minV, maxY: maxV,
+        gridData: _stdGrid, borderData: FlBorderData(show: false),
+        lineBarsData: [
+          LineChartBarData(spots: ph((e) => e.v1), color: phaseColors[0],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+          LineChartBarData(spots: ph((e) => e.v2), color: phaseColors[1],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+          LineChartBarData(spots: ph((e) => e.v3), color: phaseColors[2],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+        ],
+        titlesData: _timeTitles(
+          leftWidget: (v, _) =>
+              Text(v.toStringAsFixed(0), style: const TextStyle(fontSize: 9)),
+          leftReserved: 40),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (spots) {
+            const labels = ['L1', 'L2', 'L3'];
+            return spots.map((s) {
+              final idx = s.barIndex < 3 ? s.barIndex : 0;
+              return LineTooltipItem(
+                '${labels[idx]}: ${s.y.toStringAsFixed(0)} V\n${_xToTime(s.x)}',
+                TextStyle(color: phaseColors[idx], fontSize: 11));
+            }).toList();
+          },
+        )),
+      )),
+    );
+  }
+
+  Widget _buildSlaveCurrentChart() {
+    final valid = _slog.where((e) => e.i1 > 0 || e.i2 > 0 || e.i3 > 0).toList();
+    if (valid.isEmpty) return _emptyChart('No current data');
+    final phaseColors = [Colors.amber.shade700, Colors.orange.shade600, Colors.deepOrange.shade500];
+    List<FlSpot> ph(double Function(_SEntry) fn) =>
+        valid.map((e) => FlSpot(_xForS(e), fn(e))).toList();
+    final allI = valid.expand((e) => [e.i1, e.i2, e.i3]).where((v) => v > 0).toList();
+    final maxI = allI.isEmpty ? 20.0 : allI.reduce((a, b) => a > b ? a : b) + 2;
+    return _ChartCard(
+      title: 'Current (A)',
+      legend: Row(children: [
+        _LegendDot(color: phaseColors[0], label: 'I1'),
+        const SizedBox(width: 10),
+        _LegendDot(color: phaseColors[1], label: 'I2'),
+        const SizedBox(width: 10),
+        _LegendDot(color: phaseColors[2], label: 'I3'),
+      ]),
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: 0, maxY: maxI,
+        gridData: _stdGrid, borderData: FlBorderData(show: false),
+        lineBarsData: [
+          LineChartBarData(spots: ph((e) => e.i1), color: phaseColors[0],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+          LineChartBarData(spots: ph((e) => e.i2), color: phaseColors[1],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+          LineChartBarData(spots: ph((e) => e.i3), color: phaseColors[2],
+              isCurved: true, barWidth: 2, dotData: const FlDotData(show: false)),
+        ],
+        titlesData: _timeTitles(
+          leftWidget: (v, _) =>
+              Text(v.toStringAsFixed(0), style: const TextStyle(fontSize: 9))),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (spots) {
+            const labels = ['I1', 'I2', 'I3'];
+            return spots.map((s) {
+              final idx = s.barIndex < 3 ? s.barIndex : 0;
+              return LineTooltipItem(
+                '${labels[idx]}: ${s.y.toStringAsFixed(1)} A\n${_xToTime(s.x)}',
+                TextStyle(color: phaseColors[idx], fontSize: 11));
+            }).toList();
+          },
+        )),
+      )),
+    );
+  }
+
+  Widget _buildSlaveKwChart() {
+    final valid = _slog.where((e) => e.kw > 0).toList();
+    if (valid.isEmpty) return _emptyChart('No power data');
+    final spots = valid.map((e) => FlSpot(_xForS(e), e.kw)).toList();
+    final allKw = valid.map((e) => e.kw).toList();
+    final maxKw = allKw.reduce((a, b) => a > b ? a : b) + 0.5;
+    return _ChartCard(
+      title: 'Power (kW)',
+      child: LineChart(LineChartData(
+        minX: 0, maxX: 1440, minY: 0, maxY: maxKw,
+        gridData: _stdGrid, borderData: FlBorderData(show: false),
+        lineBarsData: [LineChartBarData(
+          spots: spots, color: Colors.green.shade600,
+          isCurved: true, barWidth: 2,
+          dotData: const FlDotData(show: false),
+          belowBarData: BarAreaData(show: true,
+              color: Colors.green.shade600.withValues(alpha: 0.15)),
+        )],
+        titlesData: _timeTitles(leftWidget: (v, _) =>
+            Text(v.toStringAsFixed(1), style: const TextStyle(fontSize: 9))),
+        lineTouchData: LineTouchData(touchTooltipData: LineTouchTooltipData(
+          getTooltipColor: (_) => Colors.black87,
+          getTooltipItems: (s) => s.map((p) => LineTooltipItem(
+            '${_xToTime(p.x)}\n${p.y.toStringAsFixed(2)} kW',
+            TextStyle(color: Colors.green.shade400, fontSize: 11))).toList(),
+        )),
+      )),
+    );
+  }
+
   // ── Tab views ────────────────────────────────────────────────────────────────
 
   Widget _buildEventsTab() {
@@ -817,25 +1467,114 @@ class _LogsPageState extends State<LogsPage>
     );
   }
 
+  // ── Line indicator (tap or swipe) ────────────────────────────────────────
+  Widget _buildLineIndicator(BuildContext ctx) {
+    final primary = Theme.of(ctx).colorScheme.primary;
+    return Row(
+      children: [1, 2].map((line) {
+        final sel = _selectedLine == line;
+        return Expanded(
+          child: GestureDetector(
+            onTap: () => _pageCtrl.animateToPage(
+              line - 1,
+              duration: const Duration(milliseconds: 280),
+              curve: Curves.easeInOut,
+            ),
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              decoration: BoxDecoration(
+                border: Border(bottom: BorderSide(
+                  color: sel ? primary : Colors.grey.shade300,
+                  width: sel ? 2.5 : 1,
+                )),
+              ),
+              child: Text(
+                'Line 0$line',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: sel ? FontWeight.w600 : FontWeight.normal,
+                  color: sel ? primary : Colors.grey.shade500,
+                ),
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _buildLine01Scroll() => SingleChildScrollView(
+    padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+    child: Column(children: [
+      _buildCurrentChart(),
+      const SizedBox(height: 12),
+      _buildThreePhaseChart(),
+      const SizedBox(height: 12),
+      _buildPowerChart(),
+      const SizedBox(height: 12),
+      _buildDailyRuntimeChart(),
+      const SizedBox(height: 24),
+    ]),
+  );
+
+  Widget _buildLine02Scroll() => SingleChildScrollView(
+    padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+    child: Column(children: [
+      _buildSlaveCurrentChart(),
+      const SizedBox(height: 12),
+      _buildSlaveVoltageChart(),
+      const SizedBox(height: 12),
+      _buildSlaveKwChart(),
+      const SizedBox(height: 12),
+      _buildSlaveDepthChart(),
+      const SizedBox(height: 12),
+      _buildSlaveFlowChart(),
+      const SizedBox(height: 24),
+    ]),
+  );
+
   Widget _buildChartsTab() {
     return Column(children: [
+      // ── Line indicator (only when slave is configured) ───────────────────
+      if (widget.slaveFbPath != null)
+        Builder(builder: _buildLineIndicator),
       _buildDaySelector(),
       Expanded(
         child: _loadingCharts
             ? const Center(child: CircularProgressIndicator())
-            : SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                child: Column(children: [
-                  _buildCurrentChart(),
-                  const SizedBox(height: 12),
-                  _buildThreePhaseChart(),
-                  const SizedBox(height: 12),
-                  _buildPowerChart(),
-                  const SizedBox(height: 12),
-                  _buildDailyRuntimeChart(),
-                  const SizedBox(height: 24),
-                ]),
-              ),
+            : widget.slaveFbPath != null
+                ? PageView.builder(
+                    controller: _pageCtrl,
+                    itemCount: 2,
+                    onPageChanged: (p) => setState(() => _selectedLine = p + 1),
+                    itemBuilder: (ctx, index) {
+                      final content = index == 0
+                          ? _buildLine01Scroll()
+                          : _buildLine02Scroll();
+                      return AnimatedBuilder(
+                        animation: _pageCtrl,
+                        child: content,
+                        builder: (ctx, child) {
+                          double diff = 0;
+                          if (_pageCtrl.hasClients &&
+                              _pageCtrl.position.hasPixels) {
+                            diff = (index - (_pageCtrl.page ?? index.toDouble()))
+                                .abs()
+                                .clamp(0.0, 1.0);
+                          }
+                          return Opacity(
+                            opacity: 1.0 - diff * 0.4,
+                            child: Transform.scale(
+                              scale: 1.0 - diff * 0.06,
+                              child: child,
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  )
+                : _buildLine01Scroll(),
       ),
     ]);
   }

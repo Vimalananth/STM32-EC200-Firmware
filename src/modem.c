@@ -54,9 +54,9 @@ extern const char g_fw_ver[];
 #define SIM_APN "airtelgprs.com"
 
 /* ── Broker ─────────────────────────────────────────────────────────────── */
-#define BROKER_HOST "broker.emqx.io"
+#define BROKER_HOST "a1dlr34wqh7zt3-ats.iot.us-east-1.amazonaws.com"
 #define BROKER_PORT "8883"
-#define CLIENT_ID "pump" PUMP_ID
+#define CLIENT_ID   "pump-861919089716939"   /* AWS IoT Thing name = IMEI */
 
 /* ── Topics ─────────────────────────────────────────────────────────────── */
 #define TOPIC_STATUS   "pump/" PUMP_ID "/status"
@@ -193,7 +193,7 @@ static uint16_t volt_trip_count2  = 0;
 
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[800];   /* must be >= largest payload (publish_status ~765 B with pwr_off) */
+static char pub_payload[824];   /* must be >= largest payload (publish_status ~787 B with mains_dur_s) */
 static bool pub_pending = false;
 /* Exact byte count sent in the last AT+QMTPUBEX command.
  * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
@@ -623,7 +623,7 @@ static void publish_vlog_for(const char *topic)
     fmt_f1(sv3,  sizeof(sv3),  v3);
     fmt_f2(sci,  sizeof(sci),  i);
     fmt_f2(skw,  sizeof(skw),  Modbus_GetKW());
-    fmt_f2(skwh, sizeof(skwh), Modbus_GetKWh()); /* meter's cumulative kWh counter */
+    snprintf(skwh, sizeof(skwh), "%lu", (unsigned long)(Modbus_GetKWh() + 0.5f)); /* kWh: integer avoids fmt_f2 9999 cap */
     uint64_t ts = Modem_GetUnixMs();
     char payload[192];   /* enlarged: +kwh field ~14 bytes */
     int len = snprintf(payload, sizeof(payload),
@@ -631,7 +631,7 @@ static void publish_vlog_for(const char *topic)
                 sv1, sv2, sv3, sci, skw, skwh);
     if (ts && len > 0 && len < (int)sizeof(payload) - 25)
         snprintf(payload + len, sizeof(payload) - (size_t)len,
-                ",\"ts\":%llu}", (unsigned long long)ts);
+                ",\"ts\":%lu}", (unsigned long)(ts / 1000ULL));
     else if (len > 0 && len < (int)sizeof(payload) - 2)
         payload[len] = '}', payload[len + 1] = '\0';
     queue_publish(topic, payload);
@@ -655,7 +655,7 @@ static void publish_line2_status(void)
         char off_st[56];
         if (ts)
             snprintf(off_st, sizeof(off_st),
-                     "{\"online\":false,\"ts\":%llu}", (unsigned long long)ts);
+                     "{\"online\":false,\"ts\":%lu}", (unsigned long)(ts / 1000ULL));
         else
             snprintf(off_st, sizeof(off_st), "{\"online\":false}");
         queue_publish(TOPIC_LINE2_STATUS, off_st);
@@ -697,7 +697,7 @@ static void publish_line2_status(void)
           slen += snprintf(st + slen, sizeof(st) - (size_t)slen, ",\"bat\":%u", (unsigned)bp); }
     if (ts && slen > 0 && slen < (int)sizeof(st) - 25)
         snprintf(st + slen, sizeof(st) - (size_t)slen,
-                 ",\"ts\":%llu}", (unsigned long long)ts);
+                 ",\"ts\":%lu}", (unsigned long)(ts / 1000ULL));
     else if (slen > 0 && slen < (int)sizeof(st) - 2)
         st[slen] = '}', st[slen + 1] = '\0';
     queue_publish(TOPIC_LINE2_STATUS, st);
@@ -733,7 +733,7 @@ static void publish_status(void)
     uint8_t  bat_pct = Battery_ReadPercent();  /* LiPo on PA0; 0xFF if read fails */
     uint32_t bat_mv  = Battery_ReadMv();       /* raw mV, e.g. 3820              */
 
-    char payload[800];
+    char payload[824];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
@@ -747,7 +747,7 @@ static void publish_status(void)
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
-             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%llu}",
+             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%lu,\"mains_dur_s\":%lu}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
@@ -766,7 +766,8 @@ static void publish_status(void)
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
              cfg_uv_restart_t,
-             (unsigned long long)(mains_is_off ? mains_off_unix_ms : 0ULL));
+             (unsigned long)(mains_is_off ? mains_off_unix_ms / 1000ULL : 0UL),
+             (unsigned long)(mains_is_off && mains_off_tick ? (HAL_GetTick() - mains_off_tick) / 1000U : 0U));
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -829,8 +830,8 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
         *saved_ms  = 0;
         if (ts_ms)
             snprintf(payload, sizeof(payload),
-                     "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d,\"ts\":%llu}",
-                     reason, relay_num, (unsigned long long)ts_ms);
+                     "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d,\"ts\":%lu}",
+                     reason, relay_num, (unsigned long)(ts_ms / 1000ULL));
         else
             snprintf(payload, sizeof(payload),
                      "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
@@ -844,8 +845,8 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
         *last_tk  = 0;
         if (ts_ms)
             snprintf(payload, sizeof(payload),
-                     "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d,\"ts\":%llu}",
-                     reason, (unsigned long)run_s, relay_num, (unsigned long long)ts_ms);
+                     "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d,\"ts\":%lu}",
+                     reason, (unsigned long)run_s, relay_num, (unsigned long)(ts_ms / 1000ULL));
         else
             snprintf(payload, sizeof(payload),
                      "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
@@ -964,10 +965,10 @@ static void check_mains_state(void)
             if (ts_ms && mains_off_unix_ms)
                 snprintf(pwr_log, sizeof(pwr_log),
                          "{\"event\":\"mains_restore\",\"duration_s\":%lu,"
-                         "\"off_ts\":%llu,\"ts\":%llu}",
+                         "\"off_ts\":%lu,\"ts\":%lu}",
                          (unsigned long)dur_s,
-                         (unsigned long long)mains_off_unix_ms,
-                         (unsigned long long)ts_ms);
+                         (unsigned long)(mains_off_unix_ms / 1000ULL),
+                         (unsigned long)(ts_ms / 1000ULL));
             else
                 snprintf(pwr_log, sizeof(pwr_log),
                          "{\"event\":\"mains_restore\",\"duration_s\":%lu}",
@@ -3306,11 +3307,19 @@ void Modem_Init(UART_HandleTypeDef *huart)
     HAL_Delay(300);
     modem_cmd("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF");
     HAL_Delay(300);
-    modem_cmd("AT+QSSLCFG=\"seclevel\",0,0");   /* no cert verify — EMQX self-signed */
+    modem_cmd("AT+QSSLCFG=\"cacert\",0,\"AmazonRootCA1.pem\"");
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"clientcert\",0,\"site02-cert.pem\"");
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"clientkey\",0,\"site02-key.pem\"");
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"seclevel\",0,2");   /* mutual TLS — AWS IoT Core */
+    HAL_Delay(300);
+    modem_cmd("AT+QSSLCFG=\"ignorelocaltime\",0,1");
     HAL_Delay(300);
     modem_cmd("AT+QSSLCFG=\"sni\",0,\"" BROKER_HOST "\"");
     HAL_Delay(300);
-    IWDG->KR = 0xAAAAU;   /* pet: 4×300 ms = 1.2 s since last pet              */
+    IWDG->KR = 0xAAAAU;
 
     /* Configure MQTT client AFTER QMTCLOSE so NVM reload can't undo these.  */
     modem_cmd("AT+QMTCFG=\"ssl\",0,1,0");       /* MQTT client 0 → SSL context 0  */
@@ -3660,9 +3669,9 @@ void Modem_Process(void)
                 char alert[72];
                 if (ts)
                     snprintf(alert, sizeof(alert),
-                             "{\"event\":\"%s\",\"ts\":%llu}",
+                             "{\"event\":\"%s\",\"ts\":%lu}",
                              slave_now ? "slave_online" : "slave_offline",
-                             (unsigned long long)ts);
+                             (unsigned long)(ts / 1000ULL));
                 else
                     snprintf(alert, sizeof(alert),
                              "{\"event\":\"%s\"}",
@@ -3709,7 +3718,7 @@ void Modem_Process(void)
                          (long)(LoRa_GetKWx10()  / 10), (long)(LoRa_GetKWx10()  % 10));
             if (ts && llen > 0 && llen < (int)sizeof(l2log) - 25)
                 snprintf(l2log + llen, sizeof(l2log) - (size_t)llen,
-                         ",\"ts\":%llu}", (unsigned long long)ts);
+                         ",\"ts\":%lu}", (unsigned long)(ts / 1000ULL));
             else if (llen > 0 && llen < (int)sizeof(l2log) - 2)
                 l2log[llen] = '}', l2log[llen + 1] = '\0';
             queue_publish(TOPIC_LINE2_LOG, l2log);
@@ -3858,7 +3867,19 @@ void Modem_Process(void)
             modem_cmd("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF");
             modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
-            modem_cmd("AT+QSSLCFG=\"seclevel\",0,0");
+            modem_cmd("AT+QSSLCFG=\"cacert\",0,\"AmazonRootCA1.pem\"");
+            modem_wait(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"clientcert\",0,\"site02-cert.pem\"");
+            modem_wait(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"clientkey\",0,\"site02-key.pem\"");
+            modem_wait(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"seclevel\",0,2");   /* mutual TLS — AWS IoT Core */
+            modem_wait(300);
+            HAL_IWDG_Refresh(&hiwdg);
+            modem_cmd("AT+QSSLCFG=\"ignorelocaltime\",0,1");
             modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QSSLCFG=\"sni\",0,\"" BROKER_HOST "\"");

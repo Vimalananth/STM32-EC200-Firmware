@@ -164,7 +164,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
 
   late final List<SiteConfig> _sites;
   final Map<String, bool?> _pumpOn = {};
-  bool _showRotation = true;
+  bool _showRotation = false;
 
   // Dynamic slave config — loaded from sites/{siteId}/config/slave_fb_path
   final Map<String, String?> _slavePaths  = {};          // siteId → slaveFbPath or null
@@ -265,7 +265,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
 
   Future<void> _loadShowRotation() async {
     final prefs = await SharedPreferences.getInstance();
-    if (mounted) setState(() => _showRotation = prefs.getBool('show_rotation_card') ?? true);
+    if (mounted) setState(() => _showRotation = prefs.getBool('show_rotation_card') ?? false);
   }
 
   Future<void> _initFCM() async {
@@ -510,6 +510,7 @@ class _SiteSectionState extends State<_SiteSection> {
             onPumpToggle: (val) =>
                 widget.onPumpToggle(widget.site.pumpIds[i], val),
             showSchedule: widget.showRotation,
+            masterStatusFbBase: widget.site.masterFbBase,
           ),
           const SizedBox(height: 16),
         ],
@@ -710,11 +711,8 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
     await db.ref(widget.rotationFbPath).update({
       'enabled':          _enabled,
       'interval_minutes': _intervalMinutes,
+      'started_at':       0,   // always reset so bridge re-initializes the timer
     });
-    if (!_enabled) {
-      // clear started_at so it restarts cleanly when re-enabled
-      await db.ref('${widget.rotationFbPath}/started_at').set(0);
-    }
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Rotation schedule saved'),
@@ -837,6 +835,7 @@ class PumpCard extends StatefulWidget {
   final String otherPumpName;
   final Future<void> Function(bool) onPumpToggle;
   final bool showSchedule;
+  final String? masterStatusFbBase; // for pump2: path to pump1 status for mains detection
 
   const PumpCard({
     super.key,
@@ -848,6 +847,7 @@ class PumpCard extends StatefulWidget {
     required this.otherPumpName,
     required this.onPumpToggle,
     this.showSchedule = true,
+    this.masterStatusFbBase,
   });
 
   @override
@@ -895,8 +895,9 @@ class _PumpCardState extends State<PumpCard> {
     final now = DateTime.now();
     final todayStartMs =
         DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+    // Relay on/off events are in alerts (bridge routes pump/XX/log → alerts)
     db
-        .ref('${widget.fbBase}/logs')
+        .ref('${widget.fbBase}/alerts')
         .orderByKey()
         .limitToLast(200)
         .onValue
@@ -907,8 +908,12 @@ class _PumpCardState extends State<PumpCard> {
       int latestOnMs = 0;
       for (final v in data.values) {
         final entry = Map<String, dynamic>.from(v as Map);
-        final ts   = (entry['ts']    as num?)?.toInt() ?? 0;
-        final ev   = entry['event']  as String? ?? '';
+        final ev   = entry['event'] as String? ?? '';
+        // Only relay on/off events — skip protection alerts, mains_restore etc.
+        if (ev != 'on' && ev != 'off') continue;
+        // Normalize ts to ms: firmware sends Unix seconds, bridge fallback sends ms
+        final rawTs = (entry['ts'] as num?)?.toInt() ?? 0;
+        final ts = rawTs > 0 && rawTs < 10000000000 ? rawTs * 1000 : rawTs;
         final runS = (entry['run_s'] as num?)?.toInt() ?? 0;
         if (ts >= todayStartMs && ev == 'off') sum += runS;
         if (ts >= todayStartMs && ev == 'on' && ts > latestOnMs) latestOnMs = ts;
@@ -932,6 +937,12 @@ class _PumpCardState extends State<PumpCard> {
   }
 
   void _listenStatus() {
+    // If a separate master path is provided (pump2), mains state comes from
+    // that listener only — don't let pump2's own status (which has no v1/v2/v3)
+    // overwrite _mainsOn back to true.
+    final bool useSeparateMaster = widget.masterStatusFbBase != null &&
+        widget.masterStatusFbBase != widget.statusFbBase;
+
     db.ref('${widget.statusFbBase}/status').onValue.listen((event) {
       final data = event.snapshot.value;
       if (data != null && mounted) {
@@ -940,20 +951,54 @@ class _PumpCardState extends State<PumpCard> {
         final double v2 = ((s['v2'] ?? 0.0) as num).toDouble();
         final double v3 = ((s['v3'] ?? 0.0) as num).toDouble();
         setState(() {
-          _relay1Cmd = (s['relay1_state']   ?? 0) == 1;
-          _isRunning = (s['relay1_running'] ?? 0) == 1;
-          _isOnline  = s['online'] ?? false;
-          _mainsOn   = s.containsKey('v1') ? (v1 >= 50.0 || v2 >= 50.0 || v3 >= 50.0) : true;
+          if (!useSeparateMaster) {
+            // pump01: read relay1 fields and mains from its own status
+            _relay1Cmd = (s['relay1_state']   ?? 0) == 1;
+            _isRunning = (s['relay1_running'] ?? 0) == 1;
+            _isOnline  = s['online'] ?? false;
+            _mainsOn   = s.containsKey('v1') ? (v1 >= 50.0 || v2 >= 50.0 || v3 >= 50.0) : true;
+          }
+          // pump02: relay state/running/mains come from master listener below
         });
       }
     });
+    // For pump2: listen to pump1 status — reads relay2_state/relay2_running + mains
+    if (useSeparateMaster) {
+      db.ref('${widget.masterStatusFbBase}/status').onValue.listen((event) {
+        final data = event.snapshot.value;
+        if (data != null && mounted) {
+          final s = Map<String, dynamic>.from(data as Map);
+          final double v1 = ((s['v1'] ?? 0.0) as num).toDouble();
+          final double v2 = ((s['v2'] ?? 0.0) as num).toDouble();
+          final double v3 = ((s['v3'] ?? 0.0) as num).toDouble();
+          setState(() {
+            _relay1Cmd = (s['relay2_state']   ?? 0) == 1;
+            _isRunning = (s['relay2_running'] ?? 0) == 1;
+            _isOnline  = s['online'] ?? false;
+            if (s.containsKey('v1')) {
+              _mainsOn = v1 >= 50.0 || v2 >= 50.0 || v3 >= 50.0;
+            }
+          });
+        }
+      });
+    }
   }
 
   void _listenAlerts() {
     db.ref('${widget.fbBase}/alerts').onValue.listen((event) {
-      final data = event.snapshot.value;
-      if (data != null && mounted) {
-        setState(() => _alerts = Map<String, dynamic>.from(data as Map));
+      final data = event.snapshot.value as Map?;
+      if (data == null || !mounted) return;
+      // alerts is a push log — find the most recent entry that contains
+      // protection fields (overvoltage etc.). Push keys are time-ordered
+      // so the last matching entry is the most recent alert state.
+      Map<String, dynamic>? latest;
+      for (final v in data.values) {
+        if (v is Map && v.containsKey('overvoltage')) {
+          latest = Map<String, dynamic>.from(v);
+        }
+      }
+      if (latest != null && mounted) {
+        setState(() => _alerts = latest!);
       }
     });
   }
@@ -1074,7 +1119,7 @@ class _PumpCardState extends State<PumpCard> {
         : !_isOnline
             ? '---'
             : !_mainsOn
-                ? 'PWR OFF'
+                ? 'STOPPED'
                 : relayOn
                     ? (_isRunning ? 'RUNNING' : 'STARTING...')
                     : 'STOPPED';
@@ -1184,30 +1229,7 @@ class _PumpCardState extends State<PumpCard> {
                             ),
                           ],
                         ),
-                      if (!loading && _isOnline && !_mainsOn)
-                        Container(
-                          margin: const EdgeInsets.only(top: 6),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.orange.shade100,
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(color: Colors.orange),
-                          ),
-                          child: const Row(children: [
-                            Icon(Icons.power_off,
-                                color: Colors.orange, size: 14),
-                            SizedBox(width: 4),
-                            Flexible(
-                              child: Text('No power',
-                                  style: TextStyle(
-                                      fontSize: 11,
-                                      color: Colors.orange,
-                                      fontWeight: FontWeight.w600)),
-                            ),
-                          ]),
-                        )
-                      else if (widget.otherPumpOn && !relayOn && !loading)
+                      if (widget.otherPumpOn && !relayOn && !loading)
                         Row(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
@@ -1385,20 +1407,32 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
 
   void _listenLogs() {
     final now = DateTime.now();
-    final cutoff = DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+    final cutoffS = DateTime(now.year, now.month, now.day).millisecondsSinceEpoch ~/ 1000;
+    // mains_restore events go via pump/XX/log → bridge → Firebase alerts
     _logsSub = db
-        .ref('${widget.fbPath}/logs')
-        .orderByChild('ts')
-        .startAt(cutoff.toDouble())
+        .ref('${widget.fbPath}/alerts')
+        .orderByKey()
+        .limitToLast(200)
         .onValue
         .listen((event) {
       final map = event.snapshot.value as Map? ?? {};
       final outages = map.values
           .whereType<Map>()
           .where((e) => e['event'] == 'mains_restore')
+          .where((e) {
+            // Normalize: firmware sends seconds, bridge fallback sends ms
+            final raw = ((e['ts'] ?? 0) as num).toInt();
+            final tsS = raw >= 10000000000 ? raw ~/ 1000 : raw;
+            return tsS >= cutoffS;
+          })
           .toList()
-        ..sort((a, b) =>
-            ((b['ts'] ?? 0) as num).compareTo((a['ts'] ?? 0) as num));
+        ..sort((a, b) {
+            int tsS(Map e) {
+              final raw = ((e['ts'] ?? 0) as num).toInt();
+              return raw >= 10000000000 ? raw ~/ 1000 : raw;
+            }
+            return tsS(b).compareTo(tsS(a));
+          });
       if (mounted) {
         setState(() => _mainsOutages = outages.cast<Map<String, dynamic>>());
       }
@@ -1498,10 +1532,7 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
     final int bat        = ((_status['bat']    ?? 255) as num).toInt();
     final bool hasBat    = bat <= 100;
     final bool noPower   = _status.containsKey('v1') && v1 < 50.0 && v2 < 50.0 && v3 < 50.0;
-    final int pvrOff     = ((_status['pwr_off'] ?? 0) as num).toInt();
-    final int outageAgeSec = pvrOff > 0
-        ? ((DateTime.now().millisecondsSinceEpoch - pvrOff) / 1000).round()
-        : 0;
+    final int outageAgeSec = ((_status['mains_dur_s'] ?? 0) as num).toInt();
     final Color onlineColor = isOnline
         ? (noPower ? Colors.orange : Colors.green)
         : Colors.red;
@@ -1541,7 +1572,7 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
                 Icon(Icons.circle, color: onlineColor, size: 12),
                 const SizedBox(width: 4),
                 Text(
-                  isOnline ? (noPower ? 'PWR OFF' : 'Online') : 'Offline',
+                  isOnline ? 'Online' : 'Offline',
                   style: TextStyle(color: onlineColor, fontSize: 13),
                 ),
                 const SizedBox(width: 8),
@@ -1604,7 +1635,7 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
                       return Padding(
                         padding: const EdgeInsets.only(bottom: 2),
                         child: Text(
-                          '• ${ts > 0 ? _fmtTime(ts) : '—'}  –  ${_fmtDuration(dur)}',
+                          '• ${ts > 0 ? _fmtTime(ts * 1000) : '—'}  –  ${_fmtDuration(dur)}',
                           style: const TextStyle(fontSize: 11),
                         ),
                       );
@@ -2163,7 +2194,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (mounted) {
       setState(() {
         _notifEnabled = prefs.getBool('notifications_enabled') ?? true;
-        _showRotation = prefs.getBool('show_rotation_card')    ?? true;
+        _showRotation = prefs.getBool('show_rotation_card')    ?? false;
       });
     }
   }

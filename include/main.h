@@ -58,7 +58,8 @@ void Debug_Print(const char *msg);  /* send string to USART2 serial monitor */
 #endif
 
 /* USER CODE BEGIN EFP */
-
+uint8_t  Battery_ReadPercent(void); /* 0–100 %; 0xFF if ADC not enabled or read fails */
+uint32_t Battery_ReadMv(void);      /* battery voltage in mV (e.g. 3820); 0 if fails  */
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

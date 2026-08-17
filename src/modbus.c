@@ -60,15 +60,35 @@
 #define TX2_LEN       8
 #define RX2_LEN       9      /* 3 + 4 + 2 */
 
+/* Request 3: Import kWh accumulator (0x0034)
+ * EM4M register map (FC04, 0-based offset from 30001):
+ *   0x002A = Total kW  (already Request 2)
+ *   0x002C = Total kVA
+ *   0x002E = Total kVAR
+ *   0x0030 = Total PF
+ *   0x0032 = Frequency
+ *   0x0034 = Import kWh  ← this request
+ * NOTE: verify 0x0034 against your specific EM4M firmware version.
+ *       If the meter returns 0 or garbage, try 0x003C (alternate mapping). */
+#define MB3_START_HI  0x00
+#define MB3_START_LO  0x34   /* Import kWh — EM4M register address 30053 */
+#define MB3_COUNT_HI  0x00
+#define MB3_COUNT_LO  0x02   /* 2 registers = 1 IEEE 754 float */
+#define TX3_LEN       8
+#define RX3_LEN       9      /* 3 + 4 + 2 */
+
 /* ── State machine ───────────────────────────────────────────────────────── */
 typedef enum {
     MB_IDLE,
-    MB_TX,       /* Request 1: send V/I query  */
-    MB_RX_WAIT,  /* Request 1: receive         */
-    MB_PARSE,    /* Request 1: validate + parse */
-    MB_TX2,      /* Request 2: send kW query   */
-    MB_RX_WAIT2, /* Request 2: receive         */
-    MB_PARSE2,   /* Request 2: validate + parse */
+    MB_TX,       /* Request 1: send V/I query      */
+    MB_RX_WAIT,  /* Request 1: receive              */
+    MB_PARSE,    /* Request 1: validate + parse     */
+    MB_TX2,      /* Request 2: send kW query        */
+    MB_RX_WAIT2, /* Request 2: receive              */
+    MB_PARSE2,   /* Request 2: validate + parse     */
+    MB_TX3,      /* Request 3: send kWh query       */
+    MB_RX_WAIT3, /* Request 3: receive              */
+    MB_PARSE3,   /* Request 3: validate + parse     */
 } MbState;
 
 static UART_HandleTypeDef *mb_uart;
@@ -81,16 +101,21 @@ static uint8_t  rx_idx      = 0;
 static uint8_t  tx_buf2[TX2_LEN];
 static uint8_t  rx_buf2[RX2_LEN];
 static uint8_t  rx_idx2     = 0;
+static uint8_t  tx_buf3[TX3_LEN];
+static uint8_t  rx_buf3[RX3_LEN];
+static uint8_t  rx_idx3     = 0;
 
-/* Safe defaults until first successful read (avoids false protection trips) */
-static float v1 = 415.0f, v2 = 415.0f, v3 = 415.0f;
-static float i1 = 5.0f,   i2 = 5.0f,   i3 = 5.0f;
+/* Zero defaults — protection is suppressed until Modbus_IsDataValid() returns true */
+static float v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+static float i1 = 0.0f, i2 = 0.0f, i3 = 0.0f;
 static float pf1 = 1.0f,  pf2 = 1.0f,  pf3 = 1.0f;
-static float kw_total = 0.0f;
+static float kw_total  = 0.0f;
+static float kwh_total = 0.0f;  /* Import kWh accumulator — meter register 0x0034 */
 
 /* Diagnostic counters — visible in Firebase as mb_ok / mb_rx */
-static uint8_t mb_last_rx = 0;   /* bytes received in last transaction (0 = no response) */
-static bool    mb_data_ok = false; /* true if last CRC passed */
+static uint8_t  mb_last_rx    = 0;   /* bytes received in last transaction (0 = no response) */
+static bool     mb_data_ok    = false; /* true if last CRC passed */
+static uint32_t mb_last_ok_tick = 0;  /* HAL_GetTick() of last successful parse; 0=never */
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
@@ -221,7 +246,8 @@ void Modbus_Process(void)
             uint16_t rx_crc = (uint16_t)rx_buf[RX_LEN - 2]
                             | ((uint16_t)rx_buf[RX_LEN - 1] << 8);
             if (crc == rx_crc) {
-                mb_data_ok = true;
+                mb_data_ok    = true;
+                mb_last_ok_tick = now;
                 /* Response layout — each float = 2 registers = 4 bytes
                  * Offset = 3 + (modbus_addr * 2)
                  * V12(0x0008)→buf+19  V23(0x000A)→buf+23  V31(0x000C)→buf+27  (L-L)
@@ -303,6 +329,70 @@ void Modbus_Process(void)
             if (crc == rx_crc)
                 kw_total = parse_float_be(rx_buf2 + 3);
         }
+        /* Chain into Request 3 (kWh) in the same poll cycle */
+        state = MB_TX3;
+        break;
+    }
+
+    /* ── TX3: send Import kWh request (register 0x0034) ─────────────── */
+    case MB_TX3: {
+        HAL_Delay(5);   /* 3.5-char silence between frames at 9600 baud */
+        { uint8_t _d; while (HAL_UART_Receive(mb_uart, &_d, 1, 1) == HAL_OK) {} }
+        tx_buf3[0] = MB_SLAVE;
+        tx_buf3[1] = MB_FC;
+        tx_buf3[2] = MB3_START_HI;
+        tx_buf3[3] = MB3_START_LO;
+        tx_buf3[4] = MB3_COUNT_HI;
+        tx_buf3[5] = MB3_COUNT_LO;
+        uint16_t crc3 = crc16(tx_buf3, 6);
+        tx_buf3[6] = (uint8_t)(crc3 & 0xFF);
+        tx_buf3[7] = (uint8_t)((crc3 >> 8) & 0xFF);
+        rx_idx3  = 0;
+        DE_TX();
+        HAL_UART_Transmit(mb_uart, tx_buf3, TX3_LEN, 20);
+        DE_RX();
+        mb_uart->ErrorCode = HAL_UART_ERROR_NONE;
+        __HAL_UART_CLEAR_FLAG(mb_uart, UART_CLEAR_OREF | UART_CLEAR_FEF | UART_CLEAR_NEF);
+        rx_start = HAL_GetTick();
+        state    = MB_RX_WAIT3;
+        break;
+    }
+
+    /* ── RX_WAIT3: accumulate kWh response bytes ─────────────────────── */
+    case MB_RX_WAIT3: {
+        uint8_t byte3;
+        while (1) {
+            uint32_t isr = mb_uart->Instance->ISR;
+            if (isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE)) {
+                mb_uart->Instance->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF;
+                mb_uart->ErrorCode = HAL_UART_ERROR_NONE;
+            }
+            if (!(isr & USART_ISR_RXNE_RXFNE))
+                break;
+            byte3 = (uint8_t)(mb_uart->Instance->RDR & 0xFFU);
+            if (rx_idx3 < RX3_LEN)
+                rx_buf3[rx_idx3++] = byte3;
+            if (rx_idx3 >= RX3_LEN) {
+                state = MB_PARSE3;
+                return;
+            }
+        }
+        if (now - rx_start > 500U) {
+            last_poll = now;
+            state     = MB_IDLE;
+        }
+        break;
+    }
+
+    /* ── PARSE3: validate CRC and extract Import kWh ─────────────────── */
+    case MB_PARSE3: {
+        if (rx_buf3[0] == MB_SLAVE && rx_buf3[1] == MB_FC && rx_buf3[2] == 0x04) {
+            uint16_t crc = crc16(rx_buf3, RX3_LEN - 2);
+            uint16_t rx_crc = (uint16_t)rx_buf3[RX3_LEN - 2]
+                            | ((uint16_t)rx_buf3[RX3_LEN - 1] << 8);
+            if (crc == rx_crc)
+                kwh_total = parse_float_be(rx_buf3 + 3);
+        }
         last_poll = now;
         state     = MB_IDLE;
         break;
@@ -320,6 +410,21 @@ float    Modbus_GetI3(void)       { return i3; }
 float    Modbus_GetPF1(void)      { return pf1; }
 float    Modbus_GetPF2(void)      { return pf2; }
 float    Modbus_GetPF3(void)      { return pf3; }
-float    Modbus_GetKW(void)       { return kw_total; }  /* Total active power (kW) */
+float    Modbus_GetKW(void)       { return kw_total; }   /* Total active power (kW)      */
+float    Modbus_GetKWh(void)      { return kwh_total; }  /* Import kWh accumulator (kWh) */
 bool     Modbus_IsDataValid(void) { return mb_data_ok; }
 uint8_t  Modbus_GetLastRx(void)   { return mb_last_rx; } /* bytes in last transaction */
+
+/* Meter is stale if no valid CRC has been received in the last 10 s.
+ * This is longer than 2 poll cycles (4 s) so a single missed response
+ * does not freeze protection unnecessarily.                            */
+bool     Modbus_IsStale(void)
+{
+    if (!mb_last_ok_tick) return true;            /* never had a valid read */
+    return (HAL_GetTick() - mb_last_ok_tick) > 10000U;
+}
+uint32_t Modbus_GetLastOkMs(void)
+{
+    if (!mb_last_ok_tick) return UINT32_MAX;      /* never valid */
+    return HAL_GetTick() - mb_last_ok_tick;
+}

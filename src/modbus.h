@@ -25,5 +25,8 @@ float   Modbus_GetPF1(void);        /* Phase 1 power factor  (-1..1) */
 float   Modbus_GetPF2(void);        /* Phase 2 power factor  (-1..1) */
 float   Modbus_GetPF3(void);        /* Phase 3 power factor  (-1..1) */
 float   Modbus_GetKW(void);         /* Total active power     (kW)   */
-bool    Modbus_IsDataValid(void);   /* true if last CRC passed       */
-uint8_t Modbus_GetLastRx(void);     /* bytes received in last tx/rx  */
+float   Modbus_GetKWh(void);        /* Import kWh accumulator (kWh)  */
+bool     Modbus_IsDataValid(void);   /* true if last CRC passed          */
+uint8_t  Modbus_GetLastRx(void);     /* bytes received in last tx/rx     */
+bool     Modbus_IsStale(void);       /* true if no valid read in 10 s    */
+uint32_t Modbus_GetLastOkMs(void);   /* ms since last successful read     */

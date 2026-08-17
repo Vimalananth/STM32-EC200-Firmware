@@ -1,0 +1,9 @@
+{
+  "name": "pump-telemetry",
+  "version": "1.0.0",
+  "description": "AWS Lambda: routes pump MQTT telemetry to Firebase",
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}

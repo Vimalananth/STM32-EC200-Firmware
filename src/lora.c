@@ -37,6 +37,7 @@ static uint16_t lora_pos = 0;
 /* ─── pending command retry ──────────────────────────────────────────────── */
 #define LORA_CMD_ACK_TIMEOUT_MS  5000U   /* wait 5 s for ACK before retry    */
 #define LORA_CMD_MAX_RETRIES     5U      /* give up after 5 retries           */
+#define LORA_PING_INTERVAL_MS   150000U  /* ping slave if silent for 150 s (2.5 × 60 s heartbeat) */
 static char     lora_pending_msg[16] = "";  /* e.g. "P1:ON" — empty = none   */
 static uint32_t lora_pending_sent_ms = 0;
 static uint8_t  lora_pending_retries = 0;
@@ -50,6 +51,10 @@ static uint32_t lora_flow_lpm_x10    = 0; /* L/min × 10, e.g. 125 = 12.5 L/min 
 static uint32_t lora_total_litres_int = 0; /* tv from last heartbeat (resets on slave reboot) */
 static uint32_t lora_tv_prev         = 0; /* previous tv — reboot detection     */
 static uint32_t lora_tv_cumulative   = 0; /* true cumulative litres, never resets */
+/* slave depth sensor — 0xFFFFFFFF = no reading / fault */
+static uint32_t lora_depth_mm        = 0xFFFFFFFFUL;
+/* slave battery — 0xFF = no reading / failed */
+static uint8_t  lora_bat_pct         = 0xFFU;
 
 /* slave EM4M energy meter — parsed from heartbeat when Blue Pill Modbus is valid */
 static bool     lora_modbus_valid = false;
@@ -61,6 +66,9 @@ static int32_t  lora_i2x100 = 0;
 static int32_t  lora_i3x100 = 0;
 static int32_t  lora_kwx10  = 0;  /* total kW × 10         (e.g.   45 = 4.5 kW)  */
 static uint32_t lora_kwh    = 0;  /* total kWh (integer)                           */
+
+/* auto-ping — timestamp of last STATUS? we sent */
+static uint32_t lora_last_ping_ms  = 0;
 
 /* last received +RCV signal quality */
 static int      lora_last_rssi     = 0;
@@ -178,6 +186,16 @@ static void lora_process_rcv(const char *line)
             lora_tv_prev          = new_tv;
             lora_total_litres_int = new_tv;
         }
+        const char *dp = strstr(data, "DP:");
+        if (dp) {
+            int32_t dpv = (int32_t)strtol(dp + 3, NULL, 10);
+            lora_depth_mm = (dpv >= 0) ? (uint32_t)dpv : 0xFFFFFFFFUL;
+        }
+        const char *batf = strstr(data, "BAT:");
+        if (batf) {
+            long bv = strtol(batf + 4, NULL, 10);
+            lora_bat_pct = (bv >= 0 && bv <= 100) ? (uint8_t)bv : 0xFFU;
+        }
 
         /* Parse EM4M energy meter fields — only present when Blue Pill Modbus valid */
         const char *v1f = strstr(data, "V1:");
@@ -256,6 +274,11 @@ void LoRa_Init(UART_HandleTypeDef *huart)
     lora_send_cmd("AT+BAND?");      lora_poll(300);
     lora_send_cmd("AT+PARAMETER?"); lora_poll(300);
     Debug_Print("[LoRa] MASTER init done (addr=1 net=6 band=865MHz)\r\n");
+
+    /* Ping slave immediately to get its state without waiting for the next
+     * 60-second heartbeat.  Sets lora_last_ping_ms so LoRa_Process()
+     * won't fire another ping for 150 s.                                  */
+    LoRa_SendStatusRequest();
 }
 
 /*
@@ -287,9 +310,30 @@ void LoRa_SendRelay(int relay_num, bool on)
     lora_send_cmd(cmd);
 }
 
+void LoRa_SendStatusRequest(void)
+{
+    if (!lora_uart) return;
+    static const char msg[] = "STATUS?";
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "AT+SEND=%s,%d,%s",
+             LORA_SLAVE_ADDR, (int)(sizeof(msg) - 1), msg);
+    Debug_Print("[LoRa] TX -> slave: STATUS?\r\n");
+    lora_send_cmd(cmd);
+    lora_last_ping_ms = HAL_GetTick();
+}
+
 void LoRa_Process(void)
 {
     if (!lora_uart) return;
+
+    /* ─── auto-ping: request status if slave has been silent for 90 s ───
+     * Rate-limited: at most one ping per LORA_PING_INTERVAL_MS.          */
+    if (LoRa_GetLastRcvAge() > LORA_PING_INTERVAL_MS &&
+        HAL_GetTick() - lora_last_ping_ms > LORA_PING_INTERVAL_MS)
+    {
+        Debug_Print("[LoRa] slave silent — sending STATUS?\r\n");
+        LoRa_SendStatusRequest();
+    }
 
     /* ─── pending command retry ──────────────────────────────────────────
      * If no ACK within LORA_CMD_ACK_TIMEOUT_MS, resend up to MAX_RETRIES. */
@@ -381,6 +425,10 @@ int32_t  LoRa_GetI2x100(void)            { return lora_i2x100; }
 int32_t  LoRa_GetI3x100(void)            { return lora_i3x100; }
 int32_t  LoRa_GetKWx10(void)             { return lora_kwx10;  }
 uint32_t LoRa_GetKWh(void)               { return lora_kwh;    }
+/* Depth in mm from last heartbeat; 0xFFFFFFFF = fault or no sensor */
+uint32_t LoRa_GetDepthMm(void)           { return lora_depth_mm; }
+/* Slave battery percentage 0-100; 0xFF = not present or read failed */
+uint8_t  LoRa_GetSlaveBatPct(void)       { return lora_bat_pct;  }
 /* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
 uint32_t LoRa_GetLastRcvAge(void)
 {

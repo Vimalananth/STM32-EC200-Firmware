@@ -5,6 +5,7 @@
 void LoRa_Init(UART_HandleTypeDef *huart);
 void LoRa_Process(void);
 void LoRa_SendRelay(int relay_num, bool on);  /* 1=pump03(P1), 2=pump04(P2) */
+void LoRa_SendStatusRequest(void);            /* send STATUS? → slave replies immediately */
 void LoRa_SendRaw(const char *msg);           /* send arbitrary msg to slave  */
 
 /* Returns last known state from slave heartbeat/ack: 1=ON, 0=OFF, -1=unknown */
@@ -19,6 +20,10 @@ uint32_t LoRa_GetLastRcvAge(void);
 uint32_t LoRa_GetFlowLpmX10(void);     /* L/min × 10, e.g. 125 = 12.5 L/min */
 uint32_t LoRa_GetTotalLitresInt(void); /* tv from last heartbeat (resets on slave reboot) */
 uint32_t LoRa_GetTvCumulative(void);   /* true cumulative litres, never resets */
+/* Depth sensor — updated on each slave heartbeat; 0xFFFFFFFF = fault/no sensor */
+uint32_t LoRa_GetDepthMm(void);
+/* Slave battery — 0–100 %; 0xFF = not present or read failed */
+uint8_t  LoRa_GetSlaveBatPct(void);
 /* EM4M energy meter — valid only when LoRa_IsModbusValid() returns true */
 bool     LoRa_IsModbusValid(void);
 int32_t  LoRa_GetV1x10(void);   /* phase 1 voltage × 10  (e.g. 2305 = 230.5 V) */
