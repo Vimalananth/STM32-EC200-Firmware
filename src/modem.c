@@ -755,7 +755,7 @@ static void publish_status(void)
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
-             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%llu,"
+             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%lu,"
              "\"cfg_rot_en\":%d,\"cfg_rot_min\":%d,\"rot_s\":%lu}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
@@ -775,7 +775,7 @@ static void publish_status(void)
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
              cfg_uv_restart_t,
-             (unsigned long long)(mains_is_off ? mains_off_unix_ms : 0ULL),
+             (unsigned long)(mains_is_off ? mains_off_unix_ms / 1000ULL : 0UL),
              cfg_rot_en, cfg_rot_min,
              (unsigned long)(noinit_rot_magic == ROT_ACCUM_MAGIC ? noinit_rot_accum_s : 0UL));
 

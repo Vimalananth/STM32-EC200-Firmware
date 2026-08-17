@@ -28,7 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-08-17a"
+#define FW_VER "2026-08-17b"
 const char g_fw_ver[] = FW_VER;
 extern volatile uint32_t g_reset_reason_magic;
 extern volatile uint32_t g_hf_pc;
