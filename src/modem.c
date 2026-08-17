@@ -95,6 +95,8 @@ static int   cfg_dry_t2  = 8;    /* s  — dry run delay for relay2          */
 static int   cfg_dry_en2 = 1;    /* 1=dry-run enabled for relay2            */
 static int   cfg_hp2     = 0;    /* relay2 pump rating                       */
 static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
+static int   cfg_rot_en   = 0;   /* 1=rotation enabled, 0=disabled          */
+static int   cfg_rot_min  = 60;  /* rotation interval in minutes (1-1440)   */
 #define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
 #define VOLT_TRIP_HOLD_S  300U    /* consecutive fault seconds before trip  */
 /* Minimum current to consider the motor actually running.
@@ -193,7 +195,7 @@ static uint16_t volt_trip_count2  = 0;
 
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[800];   /* must be >= largest payload (publish_status ~765 B with pwr_off) */
+static char pub_payload[900];   /* must be >= largest payload (publish_status ~840 B with rotation fields) */
 static bool pub_pending = false;
 /* Exact byte count sent in the last AT+QMTPUBEX command.
  * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
@@ -258,6 +260,12 @@ static uint32_t noinit_mains_magic  __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_relay1 __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_relay2 __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_slave  __attribute__((section(".noinit")));  /* Blue Pill relay */
+/* Rotation timer — accumulates mains-ON seconds so rotation survives soft reboots.
+ * When mains is off the timer is frozen; rotation only happens with AC present.  */
+#define ROT_ACCUM_MAGIC  0x524F5443UL  /* "ROTC" */
+static uint32_t noinit_rot_magic   __attribute__((section(".noinit")));
+static uint32_t noinit_rot_accum_s __attribute__((section(".noinit")));
+
 static bool mains_is_off         = false;
 static bool mains_restore_relay1 = false;
 static bool mains_restore_relay2 = false;
@@ -733,7 +741,7 @@ static void publish_status(void)
     uint8_t  bat_pct = Battery_ReadPercent();  /* LiPo on PA0; 0xFF if read fails */
     uint32_t bat_mv  = Battery_ReadMv();       /* raw mV, e.g. 3820              */
 
-    char payload[800];
+    char payload[900];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
@@ -747,7 +755,8 @@ static void publish_status(void)
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
-             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%llu}",
+             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%llu,"
+             "\"cfg_rot_en\":%d,\"cfg_rot_min\":%d,\"rot_s\":%lu}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
@@ -766,7 +775,9 @@ static void publish_status(void)
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
              cfg_uv_restart_t,
-             (unsigned long long)(mains_is_off ? mains_off_unix_ms : 0ULL));
+             (unsigned long long)(mains_is_off ? mains_off_unix_ms : 0ULL),
+             cfg_rot_en, cfg_rot_min,
+             (unsigned long)(noinit_rot_magic == ROT_ACCUM_MAGIC ? noinit_rot_accum_s : 0UL));
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -853,6 +864,88 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
     }
     queue_publish((relay_num == 2) ? TOPIC_LOG2 : TOPIC_LOG, payload);
     RelayState_Save();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Rotation logic — mains-aware timer, called every 1 s from run_protection
+ *
+ * Timer only advances when AC mains is present (!mains_is_off).
+ * State survives soft reboots via .noinit RAM (noinit_rot_accum_s).
+ * Rotation is skipped while any protection trip is active; the accumulator
+ * is cleared so the full interval restarts after protection clears.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void check_rotation(void)
+{
+    if (!cfg_rot_en || cfg_rot_min <= 0) return;  /* rotation disabled */
+    if (mains_is_off) return;                      /* AC absent — freeze timer */
+
+    if (!relay1 && !relay2) {
+        /* Nothing running — clear accumulator so interval resets from zero
+         * the next time a pump starts.                                      */
+        noinit_rot_magic   = 0U;
+        noinit_rot_accum_s = 0U;
+        return;
+    }
+
+    /* Accumulate one second of mains-on time with at least one relay ON */
+    if (noinit_rot_magic == ROT_ACCUM_MAGIC) {
+        noinit_rot_accum_s++;
+    } else {
+        noinit_rot_magic   = ROT_ACCUM_MAGIC;
+        noinit_rot_accum_s = 1U;
+    }
+
+    uint32_t threshold_s = (uint32_t)cfg_rot_min * 60U;
+    if (noinit_rot_accum_s < threshold_s) return; /* interval not elapsed yet */
+
+    /* Interval elapsed — skip rotation if any protection trip is active.
+     * Reset accumulator so the full interval restarts after protection clears. */
+    if (uv_pl_tripped1 || uv_pl_tripped2 ||
+        dry_run_tripped || dry_run_tripped2 ||
+        overload_tripped1 || overload_tripped2) {
+        noinit_rot_accum_s = 0U;
+        Debug_Print("[ROT] Threshold hit — protection active, reset timer\r\n");
+        return;
+    }
+
+    /* Exactly one relay should be ON for a clean swap.
+     * If both are ON (unexpected) just reset the timer and wait. */
+    if (relay1 == relay2) {
+        noinit_rot_accum_s = 0U;
+        return;
+    }
+
+    /* ── Perform rotation ── */
+    char pay[96];
+    uint64_t ts = Modem_GetUnixMs();
+
+    if (relay1 && !relay2) {
+        /* pump1 → pump2 */
+        Relay1_Set(false);
+        Relay2_Set(true);
+        if (ts)
+            snprintf(pay, sizeof(pay),
+                     "{\"event\":\"rotation\",\"from\":1,\"to\":2,\"ts\":%lu}",
+                     (unsigned long)(ts / 1000ULL));
+        else
+            snprintf(pay, sizeof(pay), "{\"event\":\"rotation\",\"from\":1,\"to\":2}");
+        Debug_Print("[ROT] pump1 OFF -> pump2 ON\r\n");
+    } else {
+        /* pump2 → pump1 */
+        Relay2_Set(false);
+        Relay1_Set(true);
+        if (ts)
+            snprintf(pay, sizeof(pay),
+                     "{\"event\":\"rotation\",\"from\":2,\"to\":1,\"ts\":%lu}",
+                     (unsigned long)(ts / 1000ULL));
+        else
+            snprintf(pay, sizeof(pay), "{\"event\":\"rotation\",\"from\":2,\"to\":1}");
+        Debug_Print("[ROT] pump2 OFF -> pump1 ON\r\n");
+    }
+
+    queue_publish(TOPIC_LOG, pay);
+    noinit_rot_accum_s = 0U;
+    publish_status();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1239,6 +1332,9 @@ static void run_protection(void)
         if (!relay2) { overload_tripped2 = false; overload_count2 = 0; }
     }
 
+    /* Rotation — accumulate mains-on time, swap relays when interval elapses */
+    check_rotation();
+
     /* Publish immediately when running state changes (relay ON + current confirmed).
      * Without this, STARTING→RUNNING transition waits up to 10s for next heartbeat.
      * run_protection fires every 1s; Modbus updates every 2s — transition seen within 3s. */
@@ -1476,7 +1572,7 @@ static void RelayState_Load(void)
  * Page layout: 64 bytes = 8 doublewords, CRC32 over the first 60 bytes.    */
 #define SETTINGS_FLASH_ADDR  0x0801F000UL
 #define SETTINGS_PAGE        62U
-#define SETTINGS_MAGIC       0xBEEF0001UL
+#define SETTINGS_MAGIC       0xBEEF0003UL  /* bump when struct layout changes */
 
 typedef struct {
     uint32_t magic;
@@ -1484,9 +1580,10 @@ typedef struct {
     int32_t  dry_t, hp, dry_en, start_t, uv_rst; /* relay1 int settings */
     float    dry_i2;                        /* relay2 dry-run threshold */
     int32_t  dry_t2, hp2, dry_en2, start_t2; /* relay2 int settings */
+    int32_t  rot_en, rot_min;              /* rotation: enable flag + interval (min) */
     uint32_t crc;                           /* CRC32 over all fields above */
 } SettingsBlock_t;
-_Static_assert(sizeof(SettingsBlock_t) == 64U, "SettingsBlock_t must be 64 bytes");
+_Static_assert(sizeof(SettingsBlock_t) == 72U, "SettingsBlock_t must be 72 bytes");
 
 static uint32_t settings_crc32(const void *data, size_t len)
 {
@@ -1526,6 +1623,9 @@ static void Settings_Load(void)
     cfg_hp2          = (int)p->hp2;
     cfg_dry_en2      = (int)p->dry_en2;
     cfg_start_t2     = (int)p->start_t2;
+    cfg_rot_en       = (int)p->rot_en  ? 1 : 0;
+    cfg_rot_min      = (int)p->rot_min;
+    if (cfg_rot_min < 1 || cfg_rot_min > 1440) cfg_rot_min = 60;
     Debug_Print("[CFG] Settings restored from flash\r\n");
 }
 
@@ -1547,6 +1647,8 @@ static void Settings_Save(void)
     blk.hp2      = (int32_t)cfg_hp2;
     blk.dry_en2  = (int32_t)cfg_dry_en2;
     blk.start_t2 = (int32_t)cfg_start_t2;
+    blk.rot_en   = (int32_t)cfg_rot_en;
+    blk.rot_min  = (int32_t)cfg_rot_min;
     blk.crc      = settings_crc32(&blk, sizeof(blk) - sizeof(blk.crc));
 
     HAL_FLASH_Unlock();
@@ -1601,6 +1703,10 @@ static void apply_settings(const char *json)
         t = extract_int(json, "uv_rst");
         if (t >= 0 && t <= 3600) cfg_uv_restart_t = t;
     }
+    if (strstr(json, "\"rot_en\":"))
+        cfg_rot_en = extract_int(json, "rot_en") ? 1 : 0;
+    t = extract_int(json, "rot_min");
+    if (t >= 1 && t <= 1440) cfg_rot_min = t;
     Settings_Save();
     Debug_Print("[CFG] Settings updated\r\n");
     publish_status(); /* reflect new cfg_ values immediately — don't wait for next heartbeat */

@@ -212,8 +212,8 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
   {
     __HAL_RCC_ADC_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    /* PA0=Phase1, PA4=Phase2, PA6=Phase3, PA7=ACS712 current */
-    GPIO_InitStruct.Pin  = GPIO_PIN_0 | GPIO_PIN_4 | GPIO_PIN_6 | GPIO_PIN_7;
+    /* PA0 = battery voltage sense (100kΩ+100kΩ divider, LiPo 3.7V on PA0) */
+    GPIO_InitStruct.Pin  = GPIO_PIN_0;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
