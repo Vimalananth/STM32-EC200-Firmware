@@ -95,6 +95,10 @@ static int   cfg_dry_t2  = 8;    /* s  — dry run delay for relay2          */
 static int   cfg_dry_en2 = 1;    /* 1=dry-run enabled for relay2            */
 static int   cfg_hp2     = 0;    /* relay2 pump rating                       */
 static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
+static int   cfg_rot_en        = 0;  /* 1=rotation enabled, 0=disabled              */
+static int   cfg_rot_min       = 60; /* pump1 rotation interval in minutes (1-1440)  */
+static int   cfg_rot_min2      = 60; /* pump2 rotation interval in minutes (1-1440)  */
+static int   cfg_rot_autostart = 0;  /* 1=auto-start pump1 when both idle & rot_en   */
 #define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
 #define VOLT_TRIP_HOLD_S  300U    /* consecutive fault seconds before trip  */
 /* Minimum current to consider the motor actually running.
@@ -157,6 +161,8 @@ static uint32_t last_r2_run_tick = 0;    /* HAL_GetTick() of last run_protection
 static uint32_t run_accum1_saved_ms = 0; /* run_accum1_ms value at last periodic flash save */
 static uint32_t run_accum2_saved_ms = 0; /* run_accum2_ms value at last periodic flash save */
 #define RUN_SAVE_INTERVAL_MS 900000UL    /* save run_accum every 15 min while running */
+static uint32_t run_total_s1 = 0; /* cumulative confirmed-running seconds relay1 — never resets */
+static uint32_t run_total_s2 = 0; /* cumulative confirmed-running seconds relay2 — never resets */
 
 /* ── Network real-time clock (synced via AT+CCLK? after MQTT connect) ────── */
 static uint64_t rtc_unix_ms   = 0;     /* UTC Unix time (ms) at rtc_tick_base  */
@@ -193,7 +199,7 @@ static uint16_t volt_trip_count2  = 0;
 
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[824];   /* must be >= largest payload (publish_status ~787 B with mains_dur_s) */
+static char pub_payload[960];   /* must be >= largest payload (publish_status with all fields) */
 static bool pub_pending = false;
 /* Exact byte count sent in the last AT+QMTPUBEX command.
  * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
@@ -258,6 +264,12 @@ static uint32_t noinit_mains_magic  __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_relay1 __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_relay2 __attribute__((section(".noinit")));
 static uint8_t  noinit_mains_slave  __attribute__((section(".noinit")));  /* Blue Pill relay */
+/* Rotation timer — accumulates mains-ON seconds so rotation survives soft reboots.
+ * When mains is off the timer is frozen; rotation only happens with AC present.  */
+#define ROT_ACCUM_MAGIC  0x524F5443UL  /* "ROTC" */
+static uint32_t noinit_rot_magic   __attribute__((section(".noinit")));
+static uint32_t noinit_rot_accum_s __attribute__((section(".noinit")));
+
 static bool mains_is_off         = false;
 static bool mains_restore_relay1 = false;
 static bool mains_restore_relay2 = false;
@@ -550,6 +562,18 @@ bool Modem_IsConnected(void)
     return mqtt_state == MQTT_STATE_CONNECTED;
 }
 
+/* True only during the three MQTT handshake states where timing-sensitive
+ * URCs arrive on USART1 (+QMTOPEN, +QMTCONN, +QMTSUB).  Modbus TX (8.3 ms
+ * blocking on USART2) must be suppressed during these windows to prevent
+ * USART1 FIFO overrun and URC corruption.  All other states — including
+ * DISCONNECTED and the reconnect AT sequence — are safe to poll.          */
+bool Modem_IsHandshaking(void)
+{
+    return mqtt_state == MQTT_STATE_BROKER_OPEN  ||
+           mqtt_state == MQTT_STATE_CONNECTING   ||
+           mqtt_state == MQTT_STATE_SUBSCRIBING;
+}
+
 bool Relay1_Get(void) { return relay1; }
 bool Relay2_Get(void) { return relay2; }
 
@@ -733,7 +757,7 @@ static void publish_status(void)
     uint8_t  bat_pct = Battery_ReadPercent();  /* LiPo on PA0; 0xFF if read fails */
     uint32_t bat_mv  = Battery_ReadMv();       /* raw mV, e.g. 3820              */
 
-    char payload[824];
+    char payload[960];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
@@ -747,7 +771,10 @@ static void publish_status(void)
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
              "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
-             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%lu,\"mains_dur_s\":%lu}",
+             "\"cfg_uv_rst_t\":%d,\"pwr_off\":%lu,\"mains_dur_s\":%lu,"
+             "\"cfg_rot_en\":%d,\"cfg_rot_min\":%d,\"cfg_rot_min2\":%d,"
+             "\"cfg_rot_autostart\":%d,\"rot_s\":%lu,"
+             "\"run_total_s\":%lu}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
@@ -767,7 +794,11 @@ static void publish_status(void)
              scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
              cfg_uv_restart_t,
              (unsigned long)(mains_is_off ? mains_off_unix_ms / 1000ULL : 0UL),
-             (unsigned long)(mains_is_off && mains_off_tick ? (HAL_GetTick() - mains_off_tick) / 1000U : 0U));
+             (unsigned long)(mains_is_off && mains_off_tick ? (HAL_GetTick() - mains_off_tick) / 1000U : 0U),
+             cfg_rot_en, cfg_rot_min, cfg_rot_min2,
+             cfg_rot_autostart,
+             (unsigned long)(noinit_rot_magic == ROT_ACCUM_MAGIC ? noinit_rot_accum_s : 0UL),
+             (unsigned long)run_total_s1);
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -775,10 +806,11 @@ static void publish_status(void)
 static void publish_status2(void)
 {
     /* pump02 status — relay1_state maps to physical relay2 (PB4/PB5) */
-    char payload[48];
+    char payload[80];
     snprintf(payload, sizeof(payload),
-             "{\"relay1_state\":%d,\"online\":true}",
-             relay2 ? 1 : 0);
+             "{\"relay1_state\":%d,\"run_total_s\":%lu,\"online\":true}",
+             relay2 ? 1 : 0,
+             (unsigned long)run_total_s2);
     queue_publish(TOPIC_STATUS2, payload);
 }
 
@@ -854,6 +886,91 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
     }
     queue_publish((relay_num == 2) ? TOPIC_LOG2 : TOPIC_LOG, payload);
     RelayState_Save();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Rotation logic — mains-aware timer, called every 1 s from run_protection
+ *
+ * Timer only advances when AC mains is present (!mains_is_off).
+ * State survives soft reboots via .noinit RAM (noinit_rot_accum_s).
+ * Rotation is skipped while any protection trip is active; the accumulator
+ * is cleared so the full interval restarts after protection clears.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void check_rotation(void)
+{
+    if (!cfg_rot_en || cfg_rot_min <= 0) return;  /* rotation disabled */
+    if (mains_is_off) return;                      /* AC absent — freeze timer */
+
+    if (!relay1 && !relay2) {
+        /* Nothing running — clear accumulator so interval resets from zero
+         * the next time a pump starts.                                      */
+        noinit_rot_magic   = 0U;
+        noinit_rot_accum_s = 0U;
+        /* Auto-start pump1 only.  Pump2 excluded by design: if pump1's
+         * lockout is active the operator can start pump2 manually.
+         * publish_status() is omitted — queue is single-slot and the log
+         * event below fills it; status re-publishes when r1_running rises. */
+        if (cfg_rot_autostart &&
+            !uv_pl_tripped1    && !uv_pl_tripped2 &&
+            !dry_run_tripped   && !dry_run_tripped2 &&
+            !overload_tripped1 && !overload_tripped2 &&
+            !is_volt_fault()   &&
+            HAL_GetTick() >= lockout_until) {
+            Debug_Print("[ROT] Auto-start pump1\r\n");
+            Relay1_Set(true);
+            log_relay_event(1, true, "rot_autostart");
+        }
+        return;
+    }
+
+    /* Accumulate one second of mains-on time with at least one relay ON */
+    if (noinit_rot_magic == ROT_ACCUM_MAGIC) {
+        noinit_rot_accum_s++;
+    } else {
+        noinit_rot_magic   = ROT_ACCUM_MAGIC;
+        noinit_rot_accum_s = 1U;
+    }
+
+    /* Use pump1 interval when relay1 is active, pump2 interval when relay2 is active */
+    uint32_t threshold_s = (uint32_t)(relay1 ? cfg_rot_min : cfg_rot_min2) * 60U;
+    if (noinit_rot_accum_s < threshold_s) return; /* interval not elapsed yet */
+
+    /* Interval elapsed — skip rotation if any protection trip is active.
+     * Reset accumulator so the full interval restarts after protection clears. */
+    if (uv_pl_tripped1 || uv_pl_tripped2 ||
+        dry_run_tripped || dry_run_tripped2 ||
+        overload_tripped1 || overload_tripped2) {
+        noinit_rot_accum_s = 0U;
+        Debug_Print("[ROT] Threshold hit — protection active, reset timer\r\n");
+        return;
+    }
+
+    /* Exactly one relay should be ON for a clean swap.
+     * If both are ON (unexpected) just reset the timer and wait. */
+    if (relay1 == relay2) {
+        noinit_rot_accum_s = 0U;
+        return;
+    }
+
+    /* ── Perform rotation ── */
+    if (relay1 && !relay2) {
+        /* pump1 → pump2 */
+        log_relay_event(1, false, "rotation"); /* captures run_s + resets accum1 BEFORE switch */
+        Relay1_Set(false);
+        Relay2_Set(true);
+        log_relay_event(2, true,  "rotation"); /* stamps relay2_on_tick AFTER switch */
+        Debug_Print("[ROT] pump1 OFF -> pump2 ON\r\n");
+    } else {
+        /* pump2 → pump1 */
+        log_relay_event(2, false, "rotation"); /* captures run_s + resets accum2 BEFORE switch */
+        Relay2_Set(false);
+        Relay1_Set(true);
+        log_relay_event(1, true,  "rotation"); /* stamps relay1_on_tick AFTER switch */
+        Debug_Print("[ROT] pump2 OFF -> pump1 ON\r\n");
+    }
+
+    noinit_rot_accum_s = 0U;
+    publish_status();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1240,6 +1357,9 @@ static void run_protection(void)
         if (!relay2) { overload_tripped2 = false; overload_count2 = 0; }
     }
 
+    /* Rotation — accumulate mains-on time, swap relays when interval elapses */
+    check_rotation();
+
     /* Publish immediately when running state changes (relay ON + current confirmed).
      * Without this, STARTING→RUNNING transition waits up to 10s for next heartbeat.
      * run_protection fires every 1s; Modbus updates every 2s — transition seen within 3s. */
@@ -1264,6 +1384,10 @@ static void run_protection(void)
     } else {
         last_r2_run_tick = 0;
     }
+
+    /* Accumulate lifetime run counters — increment every confirmed-running second */
+    if (r1_running) run_total_s1++;
+    if (r2_running) run_total_s2++;
 
     /* Persist run_accum to flash every 15 min while a relay is running.
      * On power cut the last saved value is restored in RelayState_Load so
@@ -1387,7 +1511,7 @@ static bool modem_is_exact_reboot_urc(const char *line);
 /* ── Relay state persistence (Flash page 31 = 0x0800F800, 2KB) ──────────────
  * Saves relay1/relay2 ON/OFF state so a power-cycle reboot restores the
  * physical latching-relay position correctly instead of defaulting to OFF. */
-#define RELAY_STATE_MAGIC  0xFEED5A5CU  /* bumped: struct now includes run_accum */
+#define RELAY_STATE_MAGIC  0xFEED5A5DU  /* bumped: struct now includes run_total_s */
 #define RELAY_STATE_ADDR   0x0800F800U
 #define RELAY_STATE_PAGE   31U
 
@@ -1397,7 +1521,9 @@ typedef struct {
     uint32_t relay2;
     uint32_t run_accum1_ms;  /* saved running time relay1 — restored on power-on */
     uint32_t run_accum2_ms;  /* saved running time relay2 — restored on power-on */
-    uint32_t _pad;           /* 24 bytes total — 3 doublewords */
+    uint32_t run_total_s1;   /* cumulative confirmed-running seconds relay1 — never resets */
+    uint32_t run_total_s2;   /* cumulative confirmed-running seconds relay2 — never resets */
+    uint32_t _pad;           /* 32 bytes total — 4 doublewords */
 } RelayState_t;
 
 static void RelayState_Save(void)
@@ -1408,6 +1534,8 @@ static void RelayState_Save(void)
     s.relay2        = relay2 ? 1U : 0U;
     s.run_accum1_ms = run_accum1_ms;
     s.run_accum2_ms = run_accum2_ms;
+    s.run_total_s1  = run_total_s1;
+    s.run_total_s2  = run_total_s2;
     s._pad          = 0U;
 
     HAL_FLASH_Unlock();
@@ -1419,11 +1547,12 @@ static void RelayState_Save(void)
     uint32_t page_err = 0;
     HAL_FLASHEx_Erase(&erase, &page_err);
 
-    uint64_t buf[3];
+    uint64_t buf[4];
     memcpy(buf, &s, sizeof(s));
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR,        buf[0]);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 8U,   buf[1]);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 16U,  buf[2]);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 24U,  buf[3]);
     HAL_FLASH_Lock();
     Debug_Print("[CFG] Relay state saved to Flash\r\n");
 }
@@ -1447,6 +1576,9 @@ static void RelayState_Load(void)
      * immediately trigger a redundant flash save (save_ms=0 vs accum>900 s). */
     if (r1) { run_accum1_ms = p->run_accum1_ms; run_accum1_saved_ms = p->run_accum1_ms; }
     if (r2) { run_accum2_ms = p->run_accum2_ms; run_accum2_saved_ms = p->run_accum2_ms; }
+    /* Lifetime counters always restored regardless of relay state */
+    run_total_s1 = p->run_total_s1;
+    run_total_s2 = p->run_total_s2;
 
     /* Step 1: RESET both relays to a known OFF state first.
      * Bistable relays hold their mechanical position through power-loss so
@@ -1477,7 +1609,7 @@ static void RelayState_Load(void)
  * Page layout: 64 bytes = 8 doublewords, CRC32 over the first 60 bytes.    */
 #define SETTINGS_FLASH_ADDR  0x0801F000UL
 #define SETTINGS_PAGE        62U
-#define SETTINGS_MAGIC       0xBEEF0001UL
+#define SETTINGS_MAGIC       0xBEEF0004UL  /* bump when struct layout changes */
 
 typedef struct {
     uint32_t magic;
@@ -1485,9 +1617,11 @@ typedef struct {
     int32_t  dry_t, hp, dry_en, start_t, uv_rst; /* relay1 int settings */
     float    dry_i2;                        /* relay2 dry-run threshold */
     int32_t  dry_t2, hp2, dry_en2, start_t2; /* relay2 int settings */
+    int32_t  rot_en, rot_min, rot_min2;    /* rotation: enable + per-pump intervals (min) */
+    int32_t  rot_autostart;                /* auto-start pump1 when both idle (0/1)     */
     uint32_t crc;                           /* CRC32 over all fields above */
 } SettingsBlock_t;
-_Static_assert(sizeof(SettingsBlock_t) == 64U, "SettingsBlock_t must be 64 bytes");
+_Static_assert(sizeof(SettingsBlock_t) == 80U, "SettingsBlock_t must be 80 bytes");
 
 static uint32_t settings_crc32(const void *data, size_t len)
 {
@@ -1527,6 +1661,12 @@ static void Settings_Load(void)
     cfg_hp2          = (int)p->hp2;
     cfg_dry_en2      = (int)p->dry_en2;
     cfg_start_t2     = (int)p->start_t2;
+    cfg_rot_en       = (int)p->rot_en  ? 1 : 0;
+    cfg_rot_min      = (int)p->rot_min;
+    if (cfg_rot_min < 1 || cfg_rot_min > 1440) cfg_rot_min = 60;
+    cfg_rot_min2      = (int)p->rot_min2;
+    if (cfg_rot_min2 < 1 || cfg_rot_min2 > 1440) cfg_rot_min2 = cfg_rot_min;
+    cfg_rot_autostart = (p->rot_autostart != 0) ? 1 : 0;
     Debug_Print("[CFG] Settings restored from flash\r\n");
 }
 
@@ -1548,7 +1688,11 @@ static void Settings_Save(void)
     blk.hp2      = (int32_t)cfg_hp2;
     blk.dry_en2  = (int32_t)cfg_dry_en2;
     blk.start_t2 = (int32_t)cfg_start_t2;
-    blk.crc      = settings_crc32(&blk, sizeof(blk) - sizeof(blk.crc));
+    blk.rot_en        = (int32_t)cfg_rot_en;
+    blk.rot_min       = (int32_t)cfg_rot_min;
+    blk.rot_min2      = (int32_t)cfg_rot_min2;
+    blk.rot_autostart = (int32_t)cfg_rot_autostart;
+    blk.crc           = settings_crc32(&blk, sizeof(blk) - sizeof(blk.crc));
 
     HAL_FLASH_Unlock();
     FLASH_EraseInitTypeDef erase = {
@@ -1602,6 +1746,14 @@ static void apply_settings(const char *json)
         t = extract_int(json, "uv_rst");
         if (t >= 0 && t <= 3600) cfg_uv_restart_t = t;
     }
+    if (strstr(json, "\"rot_en\":"))
+        cfg_rot_en = extract_int(json, "rot_en") ? 1 : 0;
+    t = extract_int(json, "rot_min");
+    if (t >= 1 && t <= 1440) cfg_rot_min = t;
+    t = extract_int(json, "rot_min2");
+    if (t >= 1 && t <= 1440) cfg_rot_min2 = t;
+    if (strstr(json, "\"rot_autostart\":"))
+        cfg_rot_autostart = extract_int(json, "rot_autostart") ? 1 : 0;
     Settings_Save();
     Debug_Print("[CFG] Settings updated\r\n");
     publish_status(); /* reflect new cfg_ values immediately — don't wait for next heartbeat */
@@ -1845,15 +1997,69 @@ static void sms_process(void)
         if (relay2 != prev2) { log_relay_event(2, false, "sms"); publish_status2(); }
         sms_reply(sender, "P2: OFF");
     }
+    else if (strstr(body_up, "ROT STATUS"))
+    {
+        char reply[120];
+        snprintf(reply, sizeof(reply),
+                 "ROT:%s P%s:%dm P%s:%dm",
+                 cfg_rot_en ? "ON" : "OFF",
+                 PUMP_ID, cfg_rot_min, PUMP_ID2, cfg_rot_min2);
+        sms_reply(sender, reply);
+    }
+    else if (strstr(body_up, "ROT1 "))
+    {
+        const char *p = strstr(body_up, "ROT1 ");
+        int t = (int)strtol(p + 5, NULL, 10);
+        if (t >= 1 && t <= 1440)
+        {
+            cfg_rot_min = t;
+            Settings_Save();
+            char reply[64];
+            snprintf(reply, sizeof(reply), "P%s interval: %dm", PUMP_ID, cfg_rot_min);
+            sms_reply(sender, reply);
+        }
+        else { sms_reply(sender, "ROT1: 1-1440 min"); }
+    }
+    else if (strstr(body_up, "ROT2 "))
+    {
+        const char *p = strstr(body_up, "ROT2 ");
+        int t = (int)strtol(p + 5, NULL, 10);
+        if (t >= 1 && t <= 1440)
+        {
+            cfg_rot_min2 = t;
+            Settings_Save();
+            char reply[64];
+            snprintf(reply, sizeof(reply), "P%s interval: %dm", PUMP_ID2, cfg_rot_min2);
+            sms_reply(sender, reply);
+        }
+        else { sms_reply(sender, "ROT2: 1-1440 min"); }
+    }
+    else if (strstr(body_up, "ROT ON"))
+    {
+        cfg_rot_en = 1;
+        Settings_Save();
+        char reply[80];
+        snprintf(reply, sizeof(reply),
+                 "ROT ON P%s:%dm P%s:%dm",
+                 PUMP_ID, cfg_rot_min, PUMP_ID2, cfg_rot_min2);
+        sms_reply(sender, reply);
+    }
+    else if (strstr(body_up, "ROT OFF"))
+    {
+        cfg_rot_en = 0;
+        Settings_Save();
+        sms_reply(sender, "ROT OFF");
+    }
     else if (strstr(body_up, "RESET"))
     {
         sms_reply(sender, "Resetting...");
+        bkup_clear_reset_count();   /* clear watchdog count so MQTT WD fires normally after reset */
         for (int i = 0; i < 4; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         NVIC_SystemReset();
     }
     else
     {
-        sms_reply(sender, "Cmds: STATUS PUMP1 ON PUMP1 OFF PUMP2 ON PUMP2 OFF RESET");
+        sms_reply(sender, "Cmds: STATUS PUMP1 ON/OFF PUMP2 ON/OFF ROT ON/OFF ROT1/2 <min> ROT STATUS RESET");
     }
 }
 
@@ -3580,13 +3786,14 @@ void Modem_Process(void)
         mqtt_state = MQTT_STATE_DISCONNECTED;
     }
 
-    /* ── PUB_WAIT_OK timeout — if +QMTPUBEX never arrives, back to CONNECTED ── */
+    /* ── PUB_WAIT_OK timeout — +QMTPUBEX never arrived; broker dropped the ACK.
+     * Go to DISCONNECTED so the watchdog and nuclear CFUN can fire if needed. */
     if (mqtt_state == MQTT_STATE_PUB_WAIT_OK &&
         HAL_GetTick() - state_entered_ms > MQTT_PUBACK_TIMEOUT_MS)
     {
-        Debug_Print("[MQTT] PubWaitOK timeout — continuing\r\n");
+        Debug_Print("[MQTT] PubWaitOK timeout — disconnecting\r\n");
         pub_pending = false;
-        mqtt_state = MQTT_STATE_CONNECTED;
+        mqtt_state = MQTT_STATE_DISCONNECTED;
     }
 
     /* ── periodic tasks (only when fully connected) ── */
@@ -3966,42 +4173,69 @@ void Modem_Process(void)
     }
 
     /* ── MQTT offline relay management ────────────────────────────────────────
-     * When MQTT goes offline: save relay states, turn both OFF, write OFF to
-     * Flash so reboots also start with relays off.
-     * When MQTT comes back online: restore saved relay states from .noinit RAM
-     * and write restored state to Flash.                                     */
+     * Short drops (cellular hiccup, tower handover) ride through without
+     * disturbing the pump — avoids water hammer, thermal cycling, and excess
+     * flash wear on every reconnect cycle.
+     *
+     * On drop   → save relay states to .noinit RAM; start 60 s debounce.
+     * < 60 s    → MQTT back before debounce fires; pump kept running, timer
+     *             cleared, no relay change and no flash write.
+     * ≥ 60 s    → cut relays, write OFF to Flash; set relay_cut flag.
+     * Reconnect after cut → restore saved states from .noinit RAM as before. */
     {
         bool mqtt_active = (mqtt_state == MQTT_STATE_CONNECTED  ||
                             mqtt_state == MQTT_STATE_PUBLISHING ||
                             mqtt_state == MQTT_STATE_PUB_WAIT_OK);
-        static bool mqtt_prev_active = false;
+        static bool     mqtt_prev_active   = false;
+        static uint32_t relay_offline_ms   = 0;    /* tick when MQTT dropped (0 = not timing) */
+        static bool     relay_cut          = false; /* true if debounce fired and relays were cut */
 
         if (!mqtt_prev_active && mqtt_active)
         {
-            /* MQTT just reconnected — restore saved relay state */
-            bool offline_valid = (noinit_offline_magic  == OFFLINE_RELAY_MAGIC) &&
-                                 (noinit_offline_relay1 <= 1U) &&
-                                 (noinit_offline_relay2 <= 1U);
-            if (offline_valid)
+            /* MQTT just reconnected */
+            if (relay_cut)
             {
-                bool r1 = (noinit_offline_relay1 != 0U);
-                bool r2 = (noinit_offline_relay2 != 0U);
-                noinit_offline_magic = 0U;          /* clear saved state     */
-                Debug_Print("[MQTT] online — restoring relay states\r\n");
-                if (r1 && !mains_is_off) { Relay1_Set(true);  relay1_on_tick = HAL_GetTick(); }
-                if (r2 && !mains_is_off) { Relay2_Set(true);  relay2_on_tick = HAL_GetTick(); }
-                RelayState_Save();                  /* update Flash          */
+                /* Debounce fired — relays were cut; restore saved states */
+                bool offline_valid = (noinit_offline_magic  == OFFLINE_RELAY_MAGIC) &&
+                                     (noinit_offline_relay1 <= 1U) &&
+                                     (noinit_offline_relay2 <= 1U);
+                if (offline_valid)
+                {
+                    bool r1 = (noinit_offline_relay1 != 0U);
+                    bool r2 = (noinit_offline_relay2 != 0U);
+                    Debug_Print("[MQTT] online — restoring relay states\r\n");
+                    if (r1 && !mains_is_off) { Relay1_Set(true);  relay1_on_tick = HAL_GetTick(); }
+                    if (r2 && !mains_is_off) { Relay2_Set(true);  relay2_on_tick = HAL_GetTick(); }
+                    RelayState_Save();
+                }
             }
+            else
+            {
+                Debug_Print("[MQTT] online — pump ran through outage (<60 s)\r\n");
+            }
+            noinit_offline_magic = 0U;   /* clear so a future boot doesn't see stale state */
+            relay_offline_ms     = 0;
+            relay_cut            = false;
         }
         else if (mqtt_prev_active && !mqtt_active)
         {
-            /* MQTT just went offline — save relay states and turn both OFF  */
+            /* MQTT just went offline — snapshot relay states, start debounce */
             noinit_offline_relay1 = relay1 ? 1U : 0U;
             noinit_offline_relay2 = relay2 ? 1U : 0U;
             noinit_offline_magic  = OFFLINE_RELAY_MAGIC;
+            relay_offline_ms      = HAL_GetTick();
+            relay_cut             = false;
+            Debug_Print("[MQTT] offline — 60 s relay debounce started\r\n");
+        }
+        else if (!mqtt_active && !relay_cut &&
+                 relay_offline_ms != 0 &&
+                 (HAL_GetTick() - relay_offline_ms >= 60000U))
+        {
+            /* 60 s debounce expired — cut relays as fail-safe */
+            relay_cut = true;
             if (relay1 || relay2)
             {
-                Debug_Print("[MQTT] offline — turning relays OFF\r\n");
+                Debug_Print("[MQTT] offline >60 s — turning relays OFF\r\n");
                 Relay1_Set(false);
                 Relay2_Set(false);
                 RelayState_Save();   /* write OFF to Flash — survives reboot */

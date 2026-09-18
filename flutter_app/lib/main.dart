@@ -40,6 +40,22 @@ const AndroidNotificationChannel _alertChannel = AndroidNotificationChannel(
   importance: Importance.high,
 );
 
+// ─── Firebase push-key → server-side ms timestamp ────────────────────────────
+// Firmware uses %llu which nano.specs doesn't support; the ts field in Firebase
+// is therefore wrong. The push key encodes the correct server time (first 8
+// chars, 6 bits each = 48-bit ms epoch). Use this instead of the ts field.
+int _pushKeyMs(String key) {
+  const chars =
+      '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+  int ms = 0;
+  for (int i = 0; i < 8 && i < key.length; i++) {
+    final idx = chars.indexOf(key[i]);
+    if (idx < 0) break;
+    ms = ms * 64 + idx;
+  }
+  return ms;
+}
+
 // ─── Site configuration ───────────────────────────────────────────────────────
 class SiteConfig {
   final String id;
@@ -328,8 +344,6 @@ class _PumpDashboardState extends State<PumpDashboard> {
               MaterialPageRoute(builder: (_) => LogsPage(
                 pumpIds:     _sites.expand((s) => s.pumpIds).toList(),
                 pumpFbBases: _sites.expand((s) => s.pumpFbPaths).toList(),
-                slaveFbPath: _slavePaths.values
-                    .firstWhere((v) => v != null, orElse: () => null),
               )),
             ),
           ),
@@ -502,7 +516,8 @@ class _SiteSectionState extends State<_SiteSection> {
             pumpId: widget.site.pumpIds[i],
             pumpName: 'Pump ${i + 1}',
             fbBase:       widget.site.pumpFbPaths[i],
-            statusFbBase: widget.site.pumpFbPaths[i],
+            statusFbBase: widget.site.masterFbBase,
+            relayNum:     i + 1,
             otherPumpOn: widget.site.pumpIds
                 .where((p) => p != widget.site.pumpIds[i])
                 .any((p) => widget.pumpOn[p] == true),
@@ -515,9 +530,10 @@ class _SiteSectionState extends State<_SiteSection> {
           const SizedBox(height: 16),
         ],
         RotationScheduleCard(
-          rotationFbPath: widget.site.rotationFbPath,
-          pump1Id: widget.site.pumpIds[0],
-          pump2Id: widget.site.pumpIds[1],
+          rotationFbPath:     widget.site.rotationFbPath,
+          masterSettingsPath: '${widget.site.masterFbBase}/settings',
+          pump1Id:            widget.site.pumpIds[0],
+          pump2Id:            widget.site.pumpIds[1],
         ),
         if (widget.simNumber != null) ...[
           const SizedBox(height: 12),
@@ -633,13 +649,15 @@ class _LinePills extends StatelessWidget {
 
 // ─── Rotation schedule card ───────────────────────────────────────────────────
 class RotationScheduleCard extends StatefulWidget {
-  final String rotationFbPath; // Firebase path for rotation_schedule doc
+  final String rotationFbPath;    // Firebase path for rotation_schedule doc
+  final String masterSettingsPath; // Firebase path for master pump settings (e.g. sites/site01/line01/pump01/settings)
   final String pump1Id;
   final String pump2Id;
 
   const RotationScheduleCard({
     super.key,
     required this.rotationFbPath,
+    required this.masterSettingsPath,
     required this.pump1Id,
     required this.pump2Id,
   });
@@ -650,11 +668,13 @@ class RotationScheduleCard extends StatefulWidget {
 class _RotationScheduleCardState extends State<RotationScheduleCard> {
   final db = FirebaseDatabase.instance;
 
-  bool   _enabled         = false;
-  int    _intervalMinutes = 240; // default 4 h
+  bool   _enabled          = false;
+  int    _intervalMinutes  = 240; // pump1 on-time, default 4 h
+  int    _intervalMinutes2 = 240; // pump2 on-time, default 4 h
   late String _currentPump;
-  int    _startedAt       = 0;
+  int    _startedAt        = 0;
   bool   _expanded        = false;
+  bool   _autoStart       = false; // cfg_rot_autostart — auto-start pump1 when both idle
   Timer? _ticker;
 
   static const _options = [
@@ -677,10 +697,12 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
       if (data != null && mounted) {
         final s = Map<String, dynamic>.from(data as Map);
         setState(() {
-          _enabled         = s['enabled']          ?? false;
-          _intervalMinutes = (s['interval_minutes'] ?? 240) as int;
-          _currentPump     = s['current_pump']      ?? widget.pump1Id;
-          _startedAt       = (s['started_at']       ?? 0) as int;
+          _enabled          = s['enabled']           ?? false;
+          _intervalMinutes  = (s['interval_minutes']  ?? 240) as int;
+          _intervalMinutes2 = (s['interval_minutes2'] ?? _intervalMinutes) as int;
+          _startedAt        = (s['started_at']        ?? 0) as int;
+          _currentPump      = (s['current_pump']      as String?) ?? widget.pump1Id;
+          _autoStart        = (s['rot_autostart']     as int? ?? 0) != 0;
         });
       }
     });
@@ -699,7 +721,8 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
   String _timeRemaining() {
     if (!_enabled || _startedAt == 0) return '';
     final elapsedMs  = DateTime.now().millisecondsSinceEpoch - _startedAt;
-    final intervalMs = _intervalMinutes * 60 * 1000;
+    final activeInterval = _currentPump == widget.pump1Id ? _intervalMinutes : _intervalMinutes2;
+    final intervalMs = activeInterval * 60 * 1000;
     final remainMs   = intervalMs - elapsedMs;
     if (remainMs <= 0) return 'Switching soon...';
     final h = remainMs ~/ 3600000;
@@ -708,10 +731,27 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
   }
 
   Future<void> _save() async {
-    await db.ref(widget.rotationFbPath).update({
-      'enabled':          _enabled,
-      'interval_minutes': _intervalMinutes,
-      'started_at':       0,   // always reset so bridge re-initializes the timer
+    final Map<String, dynamic> rotUpdate = {
+      'enabled':           _enabled,
+      'interval_minutes':  _intervalMinutes,
+      'interval_minutes2': _intervalMinutes2,
+      'rot_autostart':     _autoStart ? 1 : 0,
+    };
+    if (_enabled) {
+      // Set initial current_pump and started_at so Flutter shows countdown
+      // immediately. Bridge will overwrite these on each firmware rotation event.
+      rotUpdate['current_pump'] = _currentPump;
+      if (_startedAt == 0) rotUpdate['started_at'] = DateTime.now().millisecondsSinceEpoch;
+    } else {
+      rotUpdate['started_at'] = 0;
+    }
+    await db.ref(widget.rotationFbPath).update(rotUpdate);
+    // Write rot_en/rot_min/rot_min2 to firmware settings so bridge forwards to device
+    await db.ref(widget.masterSettingsPath).update({
+      'rot_en':        _enabled ? 1 : 0,
+      'rot_min':       _intervalMinutes,
+      'rot_min2':      _intervalMinutes2,
+      'rot_autostart': _autoStart ? 1 : 0,
     });
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -787,10 +827,26 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
                   ),
                 ],
               ),
-              // Interval picker
+              // Auto-start toggle (greyed out when rotation disabled)
               Row(
                 children: [
-                  const Text('Switch every'),
+                  Text('Auto-start pump',
+                      style: TextStyle(
+                          color: _enabled ? null : Colors.grey)),
+                  const Spacer(),
+                  Switch(
+                    value: _autoStart,
+                    activeThumbColor: Colors.teal,
+                    onChanged: _enabled
+                        ? (v) => setState(() => _autoStart = v)
+                        : null,
+                  ),
+                ],
+              ),
+              // Per-pump interval pickers
+              Row(
+                children: [
+                  Text('${widget.pump1Id.toUpperCase()} runs for'),
                   const Spacer(),
                   DropdownButton<int>(
                     value: _intervalMinutes,
@@ -802,6 +858,23 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
                         .toList(),
                     onChanged: (v) =>
                         setState(() => _intervalMinutes = v ?? 240),
+                  ),
+                ],
+              ),
+              Row(
+                children: [
+                  Text('${widget.pump2Id.toUpperCase()} runs for'),
+                  const Spacer(),
+                  DropdownButton<int>(
+                    value: _intervalMinutes2,
+                    items: _options
+                        .map((o) => DropdownMenuItem(
+                              value: o.minutes,
+                              child: Text(o.label),
+                            ))
+                        .toList(),
+                    onChanged: (v) =>
+                        setState(() => _intervalMinutes2 = v ?? 240),
                   ),
                 ],
               ),
@@ -829,8 +902,9 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
 class PumpCard extends StatefulWidget {
   final String pumpId;
   final String pumpName;
-  final String fbBase;       // Firebase base path for logs/alerts/schedule/cmd
-  final String statusFbBase; // Firebase base path for status (relay1_state, online)
+  final String fbBase;       // Firebase base path for alerts/schedule/cmd
+  final String statusFbBase; // Firebase base path for status (always master)
+  final int    relayNum;     // 1 for pump01, 2 for pump02
   final bool otherPumpOn;
   final String otherPumpName;
   final Future<void> Function(bool) onPumpToggle;
@@ -843,6 +917,7 @@ class PumpCard extends StatefulWidget {
     required this.pumpName,
     required this.fbBase,
     required this.statusFbBase,
+    required this.relayNum,
     required this.otherPumpOn,
     required this.otherPumpName,
     required this.onPumpToggle,
@@ -865,6 +940,8 @@ class _PumpCardState extends State<PumpCard> {
   int   _todayRunS        = 0;    // sum of run_s for today's completed runs
   int   _currentRunStartMs = 0;   // ms epoch when current run started (0 = unknown)
   Timer? _runTicker;
+  Map<String, dynamic> _ownAlertsRaw    = {};  // latest own alerts snapshot
+  Map<String, dynamic> _masterAlertsRaw = {};  // latest master alerts snapshot (pump02 only)
 
   // Schedule state
   bool      _schedExpanded = false;
@@ -879,8 +956,8 @@ class _PumpCardState extends State<PumpCard> {
     _listenAlerts();
     _listenSchedule();
     _listenTodayRun();
-    // Refresh display every 5 min so current run elapsed time stays current
-    _runTicker = Timer.periodic(const Duration(minutes: 5), (_) {
+    // Refresh display every 1 min so current run elapsed time stays current
+    _runTicker = Timer.periodic(const Duration(minutes: 1), (_) {
       if (mounted) setState(() {});
     });
   }
@@ -892,39 +969,92 @@ class _PumpCardState extends State<PumpCard> {
   }
 
   void _listenTodayRun() {
-    final now = DateTime.now();
     final todayStartMs =
-        DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
-    // Relay on/off events are in alerts (bridge routes pump/XX/log → alerts)
-    db
-        .ref('${widget.fbBase}/alerts')
+        DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day)
+            .millisecondsSinceEpoch;
+    final rn = widget.relayNum; // 1 = pump01, 2 = pump02
+    // pump01: fbBase == statusFbBase (same path, only one listener needed)
+    // pump02: fbBase != statusFbBase (needs master alerts for rotation events)
+    final isMaster = (widget.fbBase == widget.statusFbBase);
+
+    void recompute() {
+      // Merge own alerts + master alerts (for rotation events) into one map keyed by push-key ms
+      final Map<int, Map<String, dynamic>> events = {};
+      void addAlerts(Map<String, dynamic> raw) {
+        for (final kv in raw.entries) {
+          final ts = _pushKeyMs(kv.key.toString());
+          if (ts < todayStartMs) continue;
+          events[ts] = Map<String, dynamic>.from(kv.value as Map);
+        }
+      }
+      addAlerts(_ownAlertsRaw);
+      if (!isMaster) addAlerts(_masterAlertsRaw); // pump02 adds master rotation events
+
+      final sorted = events.entries.toList()
+        ..sort((a, b) => a.key.compareTo(b.key));
+
+      int sum = 0;
+      int? startMs;
+
+      for (final e in sorted) {
+        final ts    = e.key;
+        final ev    = e.value['event'] as String? ?? '';
+        final fromR = (e.value['from']  as num?)?.toInt();
+        final toR   = (e.value['to']    as num?)?.toInt();
+        final runS  = (e.value['run_s'] as num?)?.toInt() ?? 0;
+        final relay = (e.value['relay'] as num?)?.toInt();
+
+        // This event starts our relay: explicit "on" or rotation arriving at us
+        final myOn  = (ev == 'on'       && (relay == null || relay == rn)) ||
+                      (ev == 'rotation' && toR   == rn);
+        // This event stops our relay: explicit "off" or rotation leaving us
+        final myOff = (ev == 'off'      && (relay == null || relay == rn)) ||
+                      (ev == 'rotation' && fromR == rn);
+
+        if (myOn) {
+          startMs = ts;
+        } else if (myOff && startMs != null) {
+          if (ev == 'off') {
+            sum += runS; // use firmware's precise confirmed-running seconds
+          } else {
+            // rotation event: estimate from push-key timestamps
+            sum += (ts - startMs) ~/ 1000;
+          }
+          startMs = null;
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _todayRunS         = sum;
+          _currentRunStartMs = startMs ?? 0;
+        });
+      }
+    }
+
+    // Own alerts (on/off events + rotation events for pump01)
+    db.ref('${widget.fbBase}/alerts')
         .orderByKey()
         .limitToLast(200)
         .onValue
         .listen((event) {
       final data = event.snapshot.value as Map?;
-      if (data == null || !mounted) return;
-      int sum = 0;
-      int latestOnMs = 0;
-      for (final v in data.values) {
-        final entry = Map<String, dynamic>.from(v as Map);
-        final ev   = entry['event'] as String? ?? '';
-        // Only relay on/off events — skip protection alerts, mains_restore etc.
-        if (ev != 'on' && ev != 'off') continue;
-        // Normalize ts to ms: firmware sends Unix seconds, bridge fallback sends ms
-        final rawTs = (entry['ts'] as num?)?.toInt() ?? 0;
-        final ts = rawTs > 0 && rawTs < 10000000000 ? rawTs * 1000 : rawTs;
-        final runS = (entry['run_s'] as num?)?.toInt() ?? 0;
-        if (ts >= todayStartMs && ev == 'off') sum += runS;
-        if (ts >= todayStartMs && ev == 'on' && ts > latestOnMs) latestOnMs = ts;
-      }
-      if (mounted) {
-        setState(() {
-          _todayRunS         = sum;
-          _currentRunStartMs = latestOnMs;
-        });
-      }
+      _ownAlertsRaw = data != null ? Map<String, dynamic>.from(data) : {};
+      if (mounted) recompute();
     });
+
+    // Master alerts (rotation events) — only needed for pump02
+    if (!isMaster) {
+      db.ref('${widget.statusFbBase}/alerts')
+          .orderByKey()
+          .limitToLast(200)
+          .onValue
+          .listen((event) {
+        final data = event.snapshot.value as Map?;
+        _masterAlertsRaw = data != null ? Map<String, dynamic>.from(data) : {};
+        if (mounted) recompute();
+      });
+    }
   }
 
   String _fmtRunTime(int s) {
@@ -1143,7 +1273,7 @@ class _PumpCardState extends State<PumpCard> {
                 const Icon(Icons.timer_outlined, size: 14, color: Colors.blueGrey),
                 const SizedBox(width: 4),
                 Text(
-                  'Today: ${_fmtRunTime(_todayRunS + (_isRunning && _currentRunStartMs > 0 ? (DateTime.now().millisecondsSinceEpoch - _currentRunStartMs) ~/ 1000 : 0))}${_isRunning ? ' +' : ''}',
+                  'Today: ${_fmtRunTime(_todayRunS + (_isRunning ? (DateTime.now().millisecondsSinceEpoch - (_currentRunStartMs > 0 ? _currentRunStartMs : DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day).millisecondsSinceEpoch)) ~/ 1000 : 0))}${_isRunning ? ' +' : ''}',
                   style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
                 ),
               ],
@@ -2109,6 +2239,115 @@ class _AlertChip extends StatelessWidget {
       backgroundColor: Colors.red.shade100,
       side: BorderSide(color: Colors.red.shade300),
       padding: EdgeInsets.zero,
+    );
+  }
+}
+
+// ─── Slave Logs Page ──────────────────────────────────────────────────────────
+class SlaveLogsPage extends StatefulWidget {
+  final String slaveFbPath;
+  const SlaveLogsPage({super.key, required this.slaveFbPath});
+  @override
+  State<SlaveLogsPage> createState() => _SlaveLogsPageState();
+}
+
+class _SlaveLogsPageState extends State<SlaveLogsPage> {
+  final db = FirebaseDatabase.instance;
+  Map<String, dynamic> _log = {};
+  StreamSubscription<DatabaseEvent>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = db.ref('${widget.slaveFbPath}/slave_log').onValue.listen((event) {
+      final data = event.snapshot.value;
+      if (mounted) {
+        setState(() => _log = data != null ? Map<String, dynamic>.from(data as Map) : {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final int    r3    = ((_log['r3']    ?? -1) as num).toInt();
+    final int    r4    = ((_log['r4']    ?? -1) as num).toInt();
+    final int    rssi  = ((_log['rssi']  ??  0) as num).toInt();
+    final int    snr   = ((_log['snr']   ??  0) as num).toInt();
+    final int    ageS  = ((_log['age_s'] ??  0) as num).toInt();
+    final double fl    = ((_log['fl']    ?? 0.0) as num).toDouble();
+    final int    tv    = ((_log['tv']    ??  0) as num).toInt();
+    final int    ts    = ((_log['ts']    ??  0) as num).toInt();
+
+    String relayLabel(int v) => v == 1 ? 'ON' : v == 0 ? 'OFF' : '--';
+    Color  relayColor(int v) => v == 1 ? Colors.green : v == 0 ? Colors.red : Colors.grey;
+
+    final tsStr = ts == 0 ? '--'
+        : DateTime.fromMillisecondsSinceEpoch(ts).toLocal().toString().substring(0, 19);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Slave Unit — LoRa Log')),
+      body: _log.isEmpty
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Last Heartbeat',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                        const Divider(),
+                        _LogRow(label: 'Timestamp', value: tsStr),
+                        _LogRow(label: 'Age', value: '${ageS}s ago'),
+                        _LogRow(label: 'Relay 3', value: relayLabel(r3),
+                            color: relayColor(r3)),
+                        _LogRow(label: 'Relay 4', value: relayLabel(r4),
+                            color: relayColor(r4)),
+                        _LogRow(label: 'Flow Rate',
+                            value: '${fl.toStringAsFixed(1)} L/min',
+                            color: fl > 0 ? Colors.blue : Colors.grey),
+                        _LogRow(label: 'Total Volume', value: '$tv L'),
+                        _LogRow(label: 'LoRa RSSI', value: '$rssi dBm',
+                            color: rssi < -100 ? Colors.red : rssi < -80 ? Colors.orange : Colors.green),
+                        _LogRow(label: 'LoRa SNR', value: '$snr dB'),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+class _LogRow extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color? color;
+  const _LogRow({required this.label, required this.value, this.color});
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.grey)),
+          Text(value,
+              style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: color ?? Colors.black87)),
+        ],
+      ),
     );
   }
 }

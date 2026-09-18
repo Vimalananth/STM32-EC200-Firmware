@@ -124,9 +124,10 @@ void PendSV_Handler(void)
 void SysTick_Handler(void)
 {
   /* USER CODE BEGIN SysTick_IRQn 0 */
-  /* Keep watchdog alive even during long blocking sections in modem/OTA code.
-   * If the core hangs hard with interrupts disabled, IWDG still expires. */
-  IWDG->KR = 0xAAAAU;
+  /* Watchdog is fed by the main loop (main.c) and by explicit checkpoints
+   * inside long blocking sections (modem_wait, modem_sync_expect, OTA).
+   * Feeding from SysTick would mask a hung main loop — the ISR keeps the
+   * watchdog alive even when the super-loop is stuck.                    */
 
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();

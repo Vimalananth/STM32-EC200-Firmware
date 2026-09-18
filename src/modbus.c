@@ -176,12 +176,15 @@ void Modbus_Process(void)
 
     switch (state) {
 
-    /* ── IDLE: only poll when MQTT is connected ───────────────────────── */
+    /* ── IDLE: poll unless MQTT handshake is in progress ──────────────── */
     case MB_IDLE:
-        /* Block Modbus TX entirely during MQTT connection setup.
-         * The 8.3 ms HAL_UART_Transmit block starves USART1 and corrupts
-         * critical modem URCs (+QMTCONN, +QMTSUB) that fit in < 10 ms. */
-        if (Modem_IsConnected() && (now - last_poll >= 2000U)) {
+        /* Suppress Modbus TX only during the MQTT handshake window
+         * (BROKER_OPEN, CONNECTING, SUBSCRIBING).  The 8.3 ms
+         * HAL_UART_Transmit block starves USART1 and corrupts the
+         * timing-sensitive +QMTOPEN/+QMTCONN/+QMTSUB URCs.
+         * All other states — including DISCONNECTED — are safe to poll
+         * so protection keeps running during cloud outages.            */
+        if (!Modem_IsHandshaking() && (now - last_poll >= 2000U)) {
             state = MB_TX;
         }
         break;
