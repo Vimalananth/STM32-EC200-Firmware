@@ -15,6 +15,7 @@ void  Modem_Process(void);              /* call every loop iteration        */
 void  Modem_Send(const char *cmd);      /* send raw AT command              */
 int   Modem_Receive(uint8_t *c, uint32_t timeout_ms); /* recv 1 byte (OTA callback) */
 bool  Modem_IsConnected(void);          /* true only when MQTT CONNECTED    */
+bool  Modem_IsHandshaking(void);        /* true during BROKER_OPEN/CONNECTING/SUBSCRIBING — suppress Modbus TX */
 
 /* ── Network RTC ─────────────────────────────────────────────────────────── */
 uint64_t Modem_GetUnixMs(void);         /* ms since Unix epoch, 0 if not synced */

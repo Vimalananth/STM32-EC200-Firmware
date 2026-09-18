@@ -1,12 +1,31 @@
 // lib/logs_page.dart
 // Pump logs — Events tab (history list) + Charts tab (3 charts)
 // Charts data sources:
-//   pumps/{pumpId}/voltage_log/{key}: {ts, v1, v2, v3, current}  (5-min snapshots)
-//   pumps/{pumpId}/logs/{key}:        {event, reason, run_s, ts}
+//   {fbBase}/logs/{key}:   {v1, v2, v3, i, kw, ts}   (5-min voltage snapshots)
+//   {fbBase}/alerts/{key}: {event, reason, run_s, relay, ts}  (relay on/off events)
+//
+// NOTE: Firmware uses %llu to format ts (uint64_t) but nano.specs doesn't support
+// %llu — only the lower 32 bits are output. The bridge then multiplies by 1000
+// (thinking it's seconds), producing a timestamp far in the past. We therefore
+// decode the Firebase push key (which encodes server-side Date.now()) and use
+// that as the authoritative event timestamp.
 
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:fl_chart/fl_chart.dart';
+
+// Firebase push key → server-side ms timestamp (first 8 chars × 6 bits = 48-bit ms)
+int _pushKeyMs(String key) {
+  const chars =
+      '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+  int ms = 0;
+  for (int i = 0; i < 8 && i < key.length; i++) {
+    final idx = chars.indexOf(key[i]);
+    if (idx < 0) break;
+    ms = ms * 64 + idx;
+  }
+  return ms;
+}
 
 // ─── Voltage log entry ────────────────────────────────────────────────────────
 class _VEntry {
@@ -26,12 +45,12 @@ class _VEntry {
     required this.kw,
   });
 
-  factory _VEntry.fromMap(Map<Object?, Object?> m) => _VEntry(
-        ts:      (m['ts']      as num?)?.toInt()    ?? 0,
+  factory _VEntry.fromMap(Map<Object?, Object?> m, {int? overrideTs}) => _VEntry(
+        ts:      overrideTs ?? (m['ts'] as num?)?.toInt() ?? 0,
         v1:      (m['v1']      as num?)?.toDouble() ?? 0,
         v2:      (m['v2']      as num?)?.toDouble() ?? 0,
         v3:      (m['v3']      as num?)?.toDouble() ?? 0,
-        current: (m['current'] as num?)?.toDouble() ?? 0,
+        current: (m['i'] as num?)?.toDouble() ?? (m['current'] as num?)?.toDouble() ?? 0,
         kw:      (m['kw']      as num?)?.toDouble() ?? 0,
       );
 }
@@ -39,7 +58,8 @@ class _VEntry {
 // ─── Page ─────────────────────────────────────────────────────────────────────
 class LogsPage extends StatefulWidget {
   final List<String> pumpIds;
-  const LogsPage({super.key, required this.pumpIds});
+  final List<String> fbBases; // Firebase base paths, same order as pumpIds
+  const LogsPage({super.key, required this.pumpIds, required this.fbBases});
 
   @override
   State<LogsPage> createState() => _LogsPageState();
@@ -86,22 +106,66 @@ class _LogsPageState extends State<LogsPage>
   Future<void> _loadLogs() async {
     if (!mounted) return;
     setState(() => _loadingLogs = true);
+
+    final rn       = widget.pumpIds.indexOf(_pumpId) + 1; // relay number: 1 or 2
+    final isMaster = widget.pumpIds.indexOf(_pumpId) == 0;
+
+    // Fetch own alerts
     final snap = await _db
-        .ref('pumps/$_pumpId/logs')
-        .orderByKey()
-        .limitToLast(60)
-        .get();
+        .ref('${_fbBaseFor(_pumpId)}/alerts')
+        .orderByKey().limitToLast(100).get();
     if (!mounted) return;
+
+    // For pump02 (non-master): also fetch master alerts for rotation events,
+    // which the firmware only publishes to pump01's log (TOPIC_LOG).
+    Map? masterData;
+    if (!isMaster) {
+      final ms = await _db
+          .ref('${widget.fbBases.first}/alerts')
+          .orderByKey().limitToLast(100).get();
+      masterData = ms.value as Map?;
+    }
+
     final data = snap.value as Map?;
-    if (data == null) {
+    if (data == null && masterData == null) {
       setState(() { _logs = []; _loadingLogs = false; });
       return;
     }
-    final entries = data.entries.toList()
-      ..sort((a, b) => b.key.toString().compareTo(a.key.toString()));
+
+    // Merge own + master (rotation events only) into a single keyed map.
+    final Map<String, dynamic> merged = {};
+    data?.forEach((k, v) => merged[k.toString()] = v);
+    masterData?.forEach((k, v) {
+      final entry = Map<String, dynamic>.from(v as Map);
+      final ev    = entry['event'] as String? ?? '';
+      final fromR = (entry['from'] as num?)?.toInt();
+      final toR   = (entry['to']   as num?)?.toInt();
+      if (ev == 'rotation' && (fromR == rn || toR == rn)) {
+        merged[k.toString()] = v; // include rotation events affecting our relay
+      }
+    });
+
+    // Sort newest-first (push keys are lexicographically chronological).
+    final entries = merged.entries.toList()
+      ..sort((a, b) => b.key.compareTo(a.key));
+
     setState(() {
       _logs = entries
-          .map((e) => Map<String, dynamic>.from(e.value as Map))
+          .map((e) {
+            final entry = Map<String, dynamic>.from(e.value as Map);
+            entry['_keyTs'] = _pushKeyMs(e.key.toString());
+            entry['_rn']    = rn; // relay number needed to interpret rotation direction
+            return entry;
+          })
+          .where((e) {
+            final ev    = e['event'] as String? ?? '';
+            final relay = (e['relay'] as num?)?.toInt();
+            final fromR = (e['from']  as num?)?.toInt();
+            final toR   = (e['to']    as num?)?.toInt();
+            if (ev == 'on'  || ev == 'off')      return relay == null || relay == rn;
+            if (ev == 'rotation') return fromR == rn || toR == rn;
+            return false;
+          })
           .toList();
       _loadingLogs = false;
     });
@@ -122,17 +186,19 @@ class _LogsPageState extends State<LogsPage>
     _windowStartMs = winStart.millisecondsSinceEpoch;
     final winEndMs  = _windowStartMs + 24 * 3600 * 1000;
 
-    final chartPump = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
-    // limitToLast(1500) covers up to 5 days of 5-min slots; filter client-side
+    // limitToLast(1500) covers up to 5 days of 5-min slots; filter client-side.
+    // Use push key as authoritative ts (firmware %llu bug corrupts the ts field).
     final snap = await _db
-        .ref('pumps/$chartPump/voltage_log')
+        .ref('${widget.fbBases.first}/logs')
         .orderByKey()
         .limitToLast(1500)
         .get();
     final data = snap.value as Map?;
     if (data == null) { _vlog = []; return; }
     _vlog = data.entries
-        .map((e) => _VEntry.fromMap(e.value as Map<Object?, Object?>))
+        .map((e) => _VEntry.fromMap(
+            e.value as Map<Object?, Object?>,
+            overrideTs: _pushKeyMs(e.key.toString())))
         .where((e) => e.ts >= _windowStartMs && e.ts < winEndMs)
         .toList()
       ..sort((a, b) => a.ts.compareTo(b.ts));
@@ -140,66 +206,183 @@ class _LogsPageState extends State<LogsPage>
 
   Future<void> _loadRuntime() async {
     // Fetch voltage_log for the peak-kW / kWh helpers (_windowPeakKw, _windowKwhTotal).
-    final deviceId = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
     final snap = await _db
-        .ref('pumps/$deviceId/voltage_log')
+        .ref('${widget.fbBases.first}/logs')
         .orderByKey()
         .limitToLast(2016) // ~7 days × 288 slots/day (5-min interval)
         .get();
     final data = snap.value as Map?;
     final List<_VEntry> all = [];
     if (data != null) {
-      for (final e in data.entries) {
-        final entry = _VEntry.fromMap(e.value as Map<Object?, Object?>);
-        if (entry.ts == 0) continue;
-        all.add(entry); // keep all for peak/kWh helpers
+      for (final kv in data.entries) {
+        final ts = _pushKeyMs(kv.key.toString());
+        if (ts == 0) continue;
+        final entry = _VEntry.fromMap(
+            kv.value as Map<Object?, Object?>, overrideTs: ts);
+        all.add(entry);
       }
     }
     _allVlog = all;
   }
 
+  // Distribute [startMs, endMs) run across calendar-day buckets.
+  void _addRunAcrossDays(Map<String, int> dayMap, int startMs, int endMs) {
+    var curMs = startMs;
+    while (curMs < endMs) {
+      final curDt     = DateTime.fromMillisecondsSinceEpoch(curMs).toLocal();
+      final nextMidMs = DateTime(curDt.year, curDt.month, curDt.day + 1).millisecondsSinceEpoch;
+      final segEndMs  = endMs < nextMidMs ? endMs : nextMidMs;
+      final segSecs   = ((segEndMs - curMs) / 1000).round();
+      final label     = '${curDt.day.toString().padLeft(2, '0')}/${curDt.month.toString().padLeft(2, '0')}';
+      dayMap[label] = (dayMap[label] ?? 0) + segSecs;
+      curMs = segEndMs;
+    }
+  }
+
   Future<void> _loadPumpRuntime() async {
-    // Read each pump's event log and sum run_s per calendar day (from OFF events).
-    // This gives per-pump breakdown needed for the stacked bar chart.
-    final cutoffMs = DateTime.now()
-        .subtract(const Duration(days: 8))
-        .millisecondsSinceEpoch;
-    final Map<String, Map<String, int>> result = {};
+    // Runtime calculation — counter-based (primary) + event-pairing fallback.
+    // Primary: firmware's monotonic run_total_s counter persisted in flash.
+    //   today       = run_total_s  − run_daily[yesterday]
+    //   day d ago   = run_daily[d−1 days ago] − run_daily[d days ago]
+    // Fallback: event-pairing from alerts (used for pre-OTA days with no snapshots).
+    final now        = DateTime.now();
+    final todayDt    = DateTime(now.year, now.month, now.day);
+    final cutoffMs   = todayDt.subtract(const Duration(days: 8)).millisecondsSinceEpoch;
+    final nowMs      = now.millisecondsSinceEpoch;
+    final todayMidMs = todayDt.millisecondsSinceEpoch;
+
+    String dateKey(DateTime dt) =>
+        '${dt.year}-${dt.month.toString().padLeft(2,'0')}-${dt.day.toString().padLeft(2,'0')}';
+    String dayLbl(DateTime dt) =>
+        '${dt.day.toString().padLeft(2,'0')}/${dt.month.toString().padLeft(2,'0')}';
+
+    // Pre-fetch alerts for event-pairing fallback (covers pre-OTA history).
+    final masterFbBase = widget.fbBases.first;
+    final Map<String, Map<String, dynamic>> rawAlerts = {};
     await Future.wait(widget.pumpIds.map((pumpId) async {
       final snap = await _db
-          .ref('pumps/$pumpId/logs')
-          .orderByKey()
-          .limitToLast(500)
-          .get();
+          .ref('${_fbBaseFor(pumpId)}/alerts')
+          .orderByKey().limitToLast(500).get();
       final data = snap.value as Map?;
-      if (data == null) { result[pumpId] = {}; return; }
+      rawAlerts[pumpId] = data != null ? Map<String, dynamic>.from(data) : {};
+    }));
+    Map<String, dynamic>? masterRaw;
+    if (widget.fbBases.length > 1) {
+      final snap = await _db.ref('$masterFbBase/alerts').orderByKey().limitToLast(500).get();
+      final data = snap.value as Map?;
+      masterRaw = data != null ? Map<String, dynamic>.from(data) : null;
+    }
+
+    final Map<String, Map<String, int>> result = {};
+
+    for (int pi = 0; pi < widget.pumpIds.length; pi++) {
+      final pumpId   = widget.pumpIds[pi];
+      final fbBase   = _fbBaseFor(pumpId);
+      final rn       = pi + 1;
+      final isMaster = (pi == 0);
       final Map<String, int> dayMap = {};
-      for (final e in data.entries) {
-        final entry = Map<String, dynamic>.from(e.value as Map);
-        final ev   = entry['event'] as String? ?? '';
-        final ts   = (entry['ts']   as num?)?.toInt() ?? 0;
-        final runS = (entry['run_s'] as num?)?.toInt() ?? 0;
-        if (ev != 'off' || ts < cutoffMs || runS <= 0) continue;
-        // Split runtime across calendar days using the actual start time.
-        // e.g. pump ran 2h45m ending at 02:00 today → 1h attributerd to
-        // yesterday, 2h to today. Uses midnight boundaries.
-        final startMs = ts - runS * 1000;
-        var   curMs   = startMs;
-        while (curMs < ts) {
-          final curDt      = DateTime.fromMillisecondsSinceEpoch(curMs).toLocal();
-          final nextMidMs  = DateTime(curDt.year, curDt.month, curDt.day + 1)
-                                 .millisecondsSinceEpoch;
-          final segEndMs   = ts < nextMidMs ? ts : nextMidMs;
-          final segSecs    = ((segEndMs - curMs) / 1000).round();
-          final label      = '${curDt.day.toString().padLeft(2, '0')}/'
-                             '${curDt.month.toString().padLeft(2, '0')}';
-          dayMap[label] = (dayMap[label] ?? 0) + segSecs;
-          curMs = segEndMs;
+      final Set<String> counterCovered = {};
+
+      // ── Counter-based (primary) ──────────────────────────────────────────────
+      // Fetch run_total_s from status and up to 9 midnight snapshots in parallel.
+      final fetched = await Future.wait([
+        _db.ref('$fbBase/status/run_total_s').get(),
+        _db.ref('$fbBase/run_daily').orderByKey().limitToLast(9).get(),
+      ]);
+      final int? runTotalS = fetched[0].value != null
+          ? (fetched[0].value as num).toInt() : null;
+      final Map<String, int> snapshots = {};
+      (fetched[1].value as Map?)?.forEach((k, v) {
+        snapshots[k.toString()] = (v as num).toInt();
+      });
+
+      // today = run_total_s − snapshot[yesterday]
+      final yestKey = dateKey(todayDt.subtract(const Duration(days: 1)));
+      if (runTotalS != null && snapshots.containsKey(yestKey)) {
+        final secs = (runTotalS - snapshots[yestKey]!).clamp(0, 86400);
+        if (secs > 0) {
+          final lbl = dayLbl(todayDt);
+          dayMap[lbl] = secs;
+          counterCovered.add(lbl);
         }
       }
+
+      // day d ago = snapshot[d days ago] − snapshot[d+1 days ago]
+      for (int d = 1; d <= 7; d++) {
+        final endKey   = dateKey(todayDt.subtract(Duration(days: d)));
+        final startKey = dateKey(todayDt.subtract(Duration(days: d + 1)));
+        if (snapshots.containsKey(endKey) && snapshots.containsKey(startKey)) {
+          final secs = (snapshots[endKey]! - snapshots[startKey]!).clamp(0, 86400);
+          final lbl  = dayLbl(todayDt.subtract(Duration(days: d)));
+          if (secs > 0) {
+            dayMap[lbl] = secs;
+            counterCovered.add(lbl);
+          }
+        }
+      }
+
+      // ── Event-pairing fallback (fills days with no counter snapshots) ─────────
+      final Map<int, Map<String, dynamic>> events = {};
+      void addAlerts(Map<String, dynamic> raw) {
+        for (final kv in raw.entries) {
+          final ts = _pushKeyMs(kv.key.toString());
+          if (ts < cutoffMs) continue;
+          events[ts] = Map<String, dynamic>.from(kv.value as Map);
+        }
+      }
+      addAlerts(rawAlerts[pumpId] ?? {});
+      if (!isMaster && masterRaw != null) addAlerts(masterRaw);
+
+      final sorted = events.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
+      final Map<String, int> eventDayMap = {};
+      int? currentStartMs;
+
+      for (final e in sorted) {
+        final ts    = e.key;
+        final ev    = e.value['event'] as String? ?? '';
+        final fromR = (e.value['from']  as num?)?.toInt();
+        final toR   = (e.value['to']    as num?)?.toInt();
+        final relay = (e.value['relay'] as num?)?.toInt();
+
+        // Handles both {event:"on/off", relay:N} (new firmware) and
+        // legacy {event:"rotation", from:N, to:N} (pre-OTA firmware).
+        final myOn  = (ev == 'on'       && (relay == null || relay == rn)) ||
+                      (ev == 'rotation' && toR   == rn);
+        final myOff = (ev == 'off'      && (relay == null || relay == rn)) ||
+                      (ev == 'rotation' && fromR == rn);
+
+        if (myOn) {
+          currentStartMs = ts;
+        } else if (myOff && currentStartMs != null) {
+          _addRunAcrossDays(eventDayMap, currentStartMs, ts);
+          currentStartMs = null;
+        }
+      }
+      // Ongoing run: add today's elapsed from midnight.
+      if (currentStartMs != null) {
+        final sessionStart = currentStartMs > todayMidMs ? currentStartMs : todayMidMs;
+        final elapsedSecs  = ((nowMs - sessionStart) / 1000).round();
+        if (elapsedSecs > 0) {
+          final lbl = dayLbl(todayDt);
+          eventDayMap[lbl] = (eventDayMap[lbl] ?? 0) + elapsedSecs;
+        }
+      }
+
+      // Merge: counter-based takes priority; events fill uncovered days.
+      for (final kv in eventDayMap.entries) {
+        if (!counterCovered.contains(kv.key)) dayMap[kv.key] = kv.value;
+      }
+
       result[pumpId] = dayMap;
-    }));
+    }
     _pumpRuntime = result;
+  }
+
+  String _fbBaseFor(String pumpId) {
+    final idx = widget.pumpIds.indexOf(pumpId);
+    return (idx >= 0 && idx < widget.fbBases.length)
+        ? widget.fbBases[idx]
+        : widget.fbBases.first;
   }
 
   void _onPumpChanged(String pump) {
@@ -743,30 +926,39 @@ class _LogsPageState extends State<LogsPage>
       itemCount: _logs.length,
       separatorBuilder: (_, __) => const Divider(height: 1, indent: 56),
       itemBuilder: (ctx, i) {
-        final log    = _logs[i];
-        final event  = log['event']  as String? ?? '';
-        final reason = log['reason'] as String? ?? '';
-        final runS   = (log['run_s'] as num?)?.toInt() ?? 0;
-        final ts     = (log['ts']    as num?)?.toInt() ?? 0;
-        final c = _color(event, reason);
+        final log        = _logs[i];
+        final rawEvent   = log['event']  as String? ?? '';
+        final rawReason  = log['reason'] as String? ?? '';
+        final runS       = (log['run_s'] as num?)?.toInt() ?? 0;
+        final rn         = (log['_rn']   as int?)    ?? 1;
+        final toR        = (log['to']    as num?)?.toInt();
+        // Use push-key timestamp (_keyTs) — the ts field is corrupted by firmware
+        final keyTs      = (log['_keyTs'] as int?) ?? 0;
+
+        // Map rotation entries to effective event/reason for display
+        final isRotation    = rawEvent == 'rotation';
+        final effectiveEvent  = isRotation ? (toR == rn ? 'on' : 'off') : rawEvent;
+        final effectiveReason = isRotation ? 'rot' : rawReason;
+
+        final c = _color(effectiveEvent, effectiveReason);
         return ListTile(
           dense: true,
           leading: CircleAvatar(
             radius: 18,
             backgroundColor: c.withValues(alpha: 0.12),
-            child: Icon(_icon(event, reason), color: c, size: 20),
+            child: Icon(_icon(effectiveEvent, effectiveReason), color: c, size: 20),
           ),
           title: Text(
-            '${event == 'on' ? 'ON' : 'OFF'}  ·  ${_reasonLabel(reason)}',
+            '${effectiveEvent == 'on' ? 'ON' : 'OFF'}  ·  ${_reasonLabel(effectiveReason)}',
             style: TextStyle(
                 fontWeight: FontWeight.w600, color: c, fontSize: 13),
           ),
-          subtitle: event == 'off' && runS > 0
+          subtitle: effectiveEvent == 'off' && runS > 0
               ? Text('Run time: ${_formatRunTime(runS)}',
                   style: const TextStyle(fontSize: 12))
               : null,
-          trailing: ts > 0
-              ? Text(_formatTs(ts),
+          trailing: keyTs > 0
+              ? Text(_formatTs(keyTs),
                   style: const TextStyle(fontSize: 11, color: Colors.grey))
               : null,
         );

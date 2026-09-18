@@ -156,6 +156,11 @@ static void ota_error(const char *reason)
     ota_publish(msg);
 
     ota_send("AT+QHTTPSTOP");
+    /* Restore modem baud to 115200. OTA switched to 9600 for reliable streaming;
+     * if we don't restore here, NVIC_SystemReset (from MQTT watchdog) boots the
+     * STM32 at 115200 while modem is still at 9600 → IWDG crash loop.        */
+    ota_send("AT+IPR=115200");
+    ota_delay_wdg(300);
     ota_enter(OTA_ST_ERROR, 0);
 
     char dbg[64];
@@ -853,12 +858,15 @@ void OTA_Process(void)
             ota_delay_wdg(3000);
             ota_send("AT+QIDEACT=1");
             ota_delay_wdg(5000);
-            /* Do NOT issue AT+CFUN=1,1 here.  Modem_Init in the new
-             * firmware issues a single AT+CFUN=1,1 after detecting the
-             * OTA sentinel — that is the proven-reliable place to clear
-             * the EC200U TLS heap (double-CFUN caused intermittent
-             * APP RDY miss and left the modem unconfigured).           */
-            Debug_Print("[OTA] QHTTPSTOP+QIDEACT done — resetting STM32\r\n");
+            /* Restore modem baud to 115200 before reset.  OTA download used
+             * 9600 baud (switched in modem_ota_start).  New firmware's
+             * MX_USART1_UART_Init() starts STM32 UART at 115200, so the
+             * modem must also be at 115200 on first boot — otherwise every
+             * AT command including AT+CFUN=1,1 arrives as garbage and
+             * causes an IWDG crash loop.                                */
+            ota_send("AT+IPR=115200");
+            ota_delay_wdg(300);
+            Debug_Print("[OTA] baud restored to 115200 — resetting STM32\r\n");
             ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();
         }
